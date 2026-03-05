@@ -1,0 +1,31 @@
+[project]
+name = "kandy"
+version = "0.1.0"
+description = "kandy using crewAI"
+authors = [{ name = "Your Name", email = "you@example.com" }]
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "crewai[anthropic,tools]==1.9.3",
+    # KANDy scientific stack
+    "pykan>=0.2.0",
+    "torch>=2.0",
+    "scipy>=1.10",
+    "sympy>=1.12",
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+]
+
+[project.scripts]
+kandy = "kandy.main:run"
+run_crew = "kandy.main:run"
+train = "kandy.main:train"
+replay = "kandy.main:replay"
+test = "kandy.main:test"
+run_with_trigger = "kandy.main:run_with_trigger"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.crewai]
+type = "crew"

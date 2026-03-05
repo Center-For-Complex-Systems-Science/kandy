@@ -1,0 +1,113 @@
+clean_experimental_results:
+  description: >
+    Audit all existing KANDy experiments for correctness against the true algorithm:
+    x_dot = A * Psi(phi(x)), single-layer KAN (width=[m,n]), Koopman lift phi.
+
+    Experiments to audit:
+      henon.py, hopf.ipynb, Lorenz (3).ipynb, Navier-Stokes.ipynb,
+      Kuramoto-Sivashinsky (1).ipynb, Inviscid_Burgers (1).ipynb,
+      Inviscd-Burgers-fourier-mode-ics.ipynb
+
+    For each experiment check:
+      1. LIFT: Does phi(x) include all cross-terms (e.g., x*y, x*z for Lorenz)?
+         Missing cross-terms in phi mean the algorithm is wrong, not just incomplete.
+      2. KAN DEPTH: Is the KAN single-layer (width=[m,n])? Multi-layer is incorrect.
+      3. SEEDS: Are random seeds fixed for reproducibility?
+      4. FIGURES: Are figures saved as PNG (300 dpi) + PDF?
+      5. VALIDATION: Is autoregressive rollout with RMSE/NRMSE present?
+      6. EXTRACTION: Are psi_i and A extracted symbolically?
+  expected_output: >
+    Markdown audit report with one section per experiment:
+      - Algorithm compliance: correct lift, single-layer KAN, symbolic extraction
+      - Issues found with specific fixes (code snippets where helpful)
+    Followed by: proposed results/{system}/ directory structure and top-5 priority fixes.
+  agent: phd_student
+
+generate_new_results:
+  description: >
+    Write a complete, correct KANDy experiment script for {system}.
+    Algorithm: x_dot = A * Psi(phi(x)).
+
+    Steps:
+    1. DATA: Generate trajectory using solve_ivp or RK4. Fix random seed.
+    2. LIFT: Design phi(x) for {system}. Include ALL cross-interaction terms explicitly.
+       For Lorenz: phi = (x, y, z, x^2, x*y, x*z, y^2, y*z, z^2).
+       Document why each term is included (reference known equations).
+    3. DATASET: Compute theta=phi(x) for all snapshots.
+       Build {train_input: theta, train_label: x_dot, val_input:..., val_label:...,
+              test_input:..., test_label:...}.
+    4. TRAIN: model = KAN(width=[m, n], grid=g, k=k). model.fit(dataset, opt='LBFGS').
+       m=dim(phi), n=dim(x_dot). Log loss per step.
+    5. EXTRACT: model.auto_symbolic(). Get psi_i from model.symbolic_formula().
+       Print A from output weights. Round to 3 decimal places.
+    6. ROLLOUT: Integrate x_dot=A*Psi(phi(x)) with RK4. Compute RMSE and NRMSE.
+    7. FIGURES: Save loss curve, trajectory overlay, phase portrait as PNG+PDF in results/{system}/.
+  expected_output: >
+    A complete runnable Python script for {system} that:
+      - Uses correct single-layer KAN with Koopman-lifted inputs
+      - Extracts and prints psi_i (SymPy) and A (numpy) symbolically
+      - Runs rollout and prints RMSE/NRMSE summary
+      - Saves all figures as PNG (300 dpi) + PDF in results/{system}/
+  agent: phd_student
+  context:
+    - clean_experimental_results
+
+develop_package_code:
+  description: >
+    Design and implement the initial `kandy` Python package for the algorithm
+    x_dot = A * Psi(phi(x)).
+
+    Required API:
+      lift = PolynomialLift(degree=2)   # or DelayEmbedding, or custom callable
+      model = KANDy(lift=lift, grid=5, k=3)
+      model.fit(X, X_dot)              # or model.fit(X_traj, dt=0.01)
+      A = model.get_A()                # numpy array (n x m)
+      formulas = model.get_formula()   # list of n SymPy expressions
+      X_pred = model.rollout(x0, T, dt)
+
+    Constraints:
+      - KAN is always width=[m,n] internally. Do NOT expose depth as a parameter.
+      - PolynomialLift must include cross-products (x*y, x*z, etc.).
+      - get_formula() returns the full x_dot_i = sum_j A_ij * psi_j(phi_j(x)) expression.
+
+    Deliver: package structure, kandy/core.py (KANDy class), kandy/lifts.py
+    (Lift ABC, PolynomialLift, DelayEmbedding), examples/henon_example.py,
+    tests/test_kandy.py (5+ test outlines), pyproject.toml snippet.
+  expected_output: >
+    Package design document and implementation:
+      - Annotated directory tree
+      - kandy/core.py: KANDy class (single-layer KAN enforced, type-annotated, docstrings)
+      - kandy/lifts.py: Lift ABC, PolynomialLift with cross-products, DelayEmbedding
+      - examples/henon_example.py: full pipeline demo
+      - tests/test_kandy.py: 5+ test outlines
+      - pyproject.toml deps (pykan, torch, scipy, sympy)
+      - Brief rationale for why KAN depth is fixed at 1
+  agent: professional_coder
+  context:
+    - clean_experimental_results
+
+review_results:
+  description: >
+    Write a formal peer review of the KANDy research for {system} as a referee
+    at JCP, SIADS, or NeurIPS. Evaluate:
+
+    1. NOVELTY: How does x_dot=A*Psi(phi(x)) advance beyond SINDy (fixed dict + LASSO),
+       EDMD (Psi_dot=K*Psi), and neural ODEs (black-box)?
+    2. THEORY: Are the bilinear obstruction proof and non-injectivity argument rigorous?
+    3. LIFT DESIGN: Is phi well-motivated per benchmark? Could simpler lifts work?
+    4. EXPERIMENTS: Are SINDy and EDMD baselines present? Noise robustness tested?
+    5. SYMBOLIC RECOVERY: Are formulas exact? When does extraction succeed/fail?
+    6. PACKAGE: Does the API correctly enforce single-layer KAN and explicit lift design?
+    7. LIMITATIONS: What should be honestly stated (lift requires domain knowledge, etc.)?
+  expected_output: >
+    Formal referee report in markdown (saved to outputs/review.md):
+      - Contribution summary (3-4 sentences)
+      - Major concerns (numbered, each with remedy)
+      - Minor concerns (numbered)
+      - Comments on proofs and experimental figures
+      - Recommendation (Accept / Minor Revision / Major Revision / Reject)
+      - Top-3 highest-impact action items
+  agent: journal_reviewer
+  context:
+    - generate_new_results
+    - develop_package_code
