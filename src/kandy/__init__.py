@@ -20,6 +20,7 @@ from .lifts import (
     DelayEmbedding,
     DMDLift,
     FourierLift,
+    KANELift,
     Lift,
     PolynomialLift,
     RadialBasisLift,
@@ -93,6 +94,7 @@ __all__ = [
     "FourierLift",
     "RadialBasisLift",
     "DMDLift",
+    "KANELift",         # EXPERIMENTAL
     # numerics
     "burgers_flux",
     "burgers_speed",
