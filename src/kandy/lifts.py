@@ -201,30 +201,98 @@ class DelayEmbedding(Lift):
 
 
 class CustomLift(Lift):
-    """Wrap any callable as a KANDy-compatible lift.
+    """Wrap hand-crafted feature functions as a KANDy-compatible lift.
+
+    This is the **primary lift type** for physics-informed KANDy experiments.
+    The core advantage of KANDy over SINDy is that the feature library is not
+    restricted to polynomials: any precomputed feature — rational functions,
+    trigonometric composites, state-dependent denominators — can be included.
+
+    The canonical example is the Ikeda optical-cavity map, where SINDy fails
+    but KANDy succeeds because the feature ``q = 1 / (1 + x² + y²)`` is
+    precomputed and handed to the KAN.  A polynomial library cannot represent
+    ``q``; a neural ODE would learn it opaquely.  KANDy precomputes it
+    explicitly and then lets the single-layer KAN learn a separable function
+    of it — which turns out to be nearly linear, giving a readable formula.
+
+    Two function signatures are required for a complete lift:
+
+    * ``fn(X: np.ndarray) -> np.ndarray`` — **NumPy version** used by
+      ``KANDy.fit()`` to build the training dataset (fast, no gradients).
+    * ``torch_fn(X: torch.Tensor) -> torch.Tensor`` — **Torch version** used
+      during rollout training (``fit_kan`` with ``rollout_weight > 0``) where
+      gradients must flow back through the feature computation.
+
+    If ``torch_fn`` is omitted, rollout-loss training will still work as long
+    as ``dynamics_fn`` is provided externally — but attaching ``torch_fn``
+    directly to the lift keeps the feature logic in one place.
 
     Parameters
     ----------
     fn : callable
-        Function with signature fn(X: np.ndarray) -> np.ndarray.
-        Must accept (N, n) input and return (N, m) output.
+        NumPy feature function: ``fn(X: ndarray (N, n)) -> ndarray (N, m)``.
     output_dim : int
-        Output dimension m.  Must be specified explicitly.
+        Output dimension m.  Must be stated explicitly.
+    torch_fn : callable, optional
+        PyTorch feature function: ``torch_fn(X: Tensor (B, n)) -> Tensor (B, m)``.
+        Required for gradient-compatible rollout training.
     name : str, optional
-        Human-readable name shown in repr.
+        Human-readable name shown in repr (default ``'custom'``).
 
-    Example
-    -------
-    >>> # Lorenz lift: [x, y, z, x^2, x*y, x*z, y^2, y*z, z^2]
-    >>> def lorenz_phi(X):
+    Attributes
+    ----------
+    torch_fn : callable or None
+        The torch feature function, accessible as ``lift.torch_fn``.  Use
+        this inside ``dynamics_fn`` to keep feature logic co-located with
+        the lift definition.
+
+    Examples
+    --------
+    Lorenz system — cross-products are all the lift needs:
+
+    >>> def lorenz_phi_np(X):
     ...     x, y, z = X[:,0], X[:,1], X[:,2]
-    ...     return np.column_stack([x, y, z, x**2, x*y, x*z, y**2, y*z, z**2])
-    >>> lift = CustomLift(lorenz_phi, output_dim=9)
+    ...     return np.column_stack([x, y, z, x*y, x*z, y*z])
+    ...
+    >>> def lorenz_phi_torch(X):
+    ...     x, y, z = X[:,0], X[:,1], X[:,2]
+    ...     return torch.stack([x, y, z, x*y, x*z, y*z], dim=1)
+    ...
+    >>> lift = CustomLift(lorenz_phi_np, output_dim=6, torch_fn=lorenz_phi_torch)
+
+    Ikeda map — rational and trig features that SINDy cannot represent:
+
+    >>> def ikeda_np(X):
+    ...     x, y = X[:,0], X[:,1]
+    ...     q = 1.0 / (1.0 + x**2 + y**2)   # <-- SINDy cannot fit this
+    ...     t = 0.4 - 6.0 * q
+    ...     return np.column_stack([0.9*x*np.cos(t), 0.9*y*np.cos(t),
+    ...                             0.9*x*np.sin(t), 0.9*y*np.sin(t)])
+    ...
+    >>> def ikeda_torch(X):
+    ...     x, y = X[:,0], X[:,1]
+    ...     q = 1.0 / (1.0 + x**2 + y**2)
+    ...     t = 0.4 - 6.0 * q
+    ...     return torch.stack([0.9*x*torch.cos(t), 0.9*y*torch.cos(t),
+    ...                         0.9*x*torch.sin(t), 0.9*y*torch.sin(t)], dim=1)
+    ...
+    >>> lift = CustomLift(ikeda_np, output_dim=4, torch_fn=ikeda_torch, name="ikeda")
+    >>> # Use lift.torch_fn inside dynamics_fn for rollout training:
+    >>> def discrete_rhs(state):
+    ...     theta_n = (lift.torch_fn(state) - feat_mean_t) / feat_std_t
+    ...     return model.model_(theta_n) - state
     """
 
-    def __init__(self, fn: callable, output_dim: int, name: str = "custom"):
+    def __init__(
+        self,
+        fn: callable,
+        output_dim: int,
+        torch_fn: Optional[callable] = None,
+        name: str = "custom",
+    ):
         self._fn = fn
         self._output_dim = output_dim
+        self.torch_fn = torch_fn
         self.name = name
 
     @property
@@ -239,7 +307,11 @@ class CustomLift(Lift):
         return result[0] if scalar else result
 
     def __repr__(self) -> str:
-        return f"CustomLift(name={self.name!r}, output_dim={self._output_dim})"
+        has_torch = self.torch_fn is not None
+        return (
+            f"CustomLift(name={self.name!r}, output_dim={self._output_dim}, "
+            f"torch_fn={'yes' if has_torch else 'no'})"
+        )
 
 
 class FourierLift(Lift):

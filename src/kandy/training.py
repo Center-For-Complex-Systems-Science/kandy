@@ -231,6 +231,8 @@ def fit_kan(
     traj_batch: int = -1,
     dynamics_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     integrator: Literal["rk4", "euler"] = "rk4",
+    # ---- early stopping ----
+    patience: int = 10,
     # ---- misc ----
     singularity_avoiding: bool = False,
     y_th: float = 1000.0,
@@ -386,7 +388,6 @@ def fit_kan(
             line_search_fn="strong_wolfe",
             tolerance_grad=1e-32,
             tolerance_change=1e-32,
-            tolerance_ys=1e-32,
         )
     else:
         raise ValueError(f"opt must be 'LBFGS' or 'Adam', got {opt!r}")
@@ -413,6 +414,13 @@ def fit_kan(
         tbatch_test = n_traj_test if (traj_batch == -1 or traj_batch > n_traj_test) else traj_batch
     else:
         n_traj_test = tbatch_test = 0
+
+    # ------------------------------------------------------------------
+    # Early stopping state
+    # ------------------------------------------------------------------
+    _best_loss       = float("inf")
+    _no_improve      = 0
+    _best_state_dict = None   # best model checkpoint for restoration
 
     # ------------------------------------------------------------------
     # Results accumulator
@@ -656,6 +664,22 @@ def fit_kan(
                 f"roll_train {rl_val:.6e} | roll_test {rlt_val:.6e} | "
                 f"reg {reg_val:.6e}"
             )
+
+        # early stopping: stop if train loss hasn't improved for `patience` steps
+        if patience > 0:
+            total_loss = tl_val + rollout_weight * rl_val
+            if total_loss < _best_loss:
+                _best_loss       = total_loss
+                _no_improve      = 0
+                import copy
+                _best_state_dict = copy.deepcopy(model.state_dict())
+            else:
+                _no_improve += 1
+            if _no_improve >= patience:
+                print(f"[fit_kan] Early stopping at step {step} (no improvement for {patience} steps).")
+                if _best_state_dict is not None:
+                    model.load_state_dict(_best_state_dict)
+                break
 
     model.log_history("fit_kan")
     model.symbolic_enabled = old_symbolic_enabled

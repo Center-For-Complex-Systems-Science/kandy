@@ -1,113 +1,274 @@
-clean_experimental_results:
+research_kane_lift:
   description: >
-    Audit all existing KANDy experiments for correctness against the true algorithm:
-    x_dot = A * Psi(phi(x)), single-layer KAN (width=[m,n]), Koopman lift phi.
+    Investigate whether KANELift (KAN autoencoder Koopman lift) can learn an interpretable,
+    accurate Koopman lift phi(x) for the Lorenz-63 system.
 
-    Experiments to audit:
-      henon.py, hopf.ipynb, Lorenz (3).ipynb, Navier-Stokes.ipynb,
-      Kuramoto-Sivashinsky (1).ipynb, Inviscid_Burgers (1).ipynb,
-      Inviscd-Burgers-fourier-mode-ics.ipynb
+    STEP 1 — Read existing code and API:
+      Use read_file to inspect examples/lorenz_example.py (reference implementation).
+      Use kandy_api_reference(topic='kanelift') for the full KANELift API.
 
-    For each experiment check:
-      1. LIFT: Does phi(x) include all cross-terms (e.g., x*y, x*z for Lorenz)?
-         Missing cross-terms in phi mean the algorithm is wrong, not just incomplete.
-      2. KAN DEPTH: Is the KAN single-layer (width=[m,n])? Multi-layer is incorrect.
-      3. SEEDS: Are random seeds fixed for reproducibility?
-      4. FIGURES: Are figures saved as PNG (300 dpi) + PDF?
-      5. VALIDATION: Is autoregressive rollout with RMSE/NRMSE present?
-      6. EXTRACTION: Are psi_i and A extracted symbolically?
+    STEP 2 — Write and run the KANE Lorenz experiment:
+      Write a script to outputs/kane_lorenz.py that:
+      a) Generates a Lorenz-63 trajectory (N=8000, dt=0.01, burn_in=500, sigma=10, rho=28, beta=8/3).
+      b) Trains KANELift with latent_dim=8, hidden_dim=None (single-layer encoder),
+         epochs=100, lr=5e-4, batch_size=512, alpha_latent=1.0, beta_recon=0.5, gamma_predx=1.0.
+      c) Plots and saves train/val loss curves to results/KANE/loss_curves.png.
+      d) Populates encoder activations and extracts symbolic formulas via lift.get_formula().
+      e) Plugs the trained lift into KANDy(lift=lift, grid=5, k=3).fit(X, X_dot) for
+         one-step derivative supervision.
+      f) Runs rollout(x0, T=2000, dt=0.01) and computes RMSE vs true trajectory.
+      g) Compares RMSE to PolynomialLift(degree=2) on the same data.
+      h) Prints eigenvalues of lift.K_.weight to inspect Koopman spectrum.
+
+    STEP 3 — Iterate:
+      Run the script with run_python_script. If it fails or RMSE is poor, diagnose and fix:
+      - If loss does not decrease: try lr=1e-3, increase epochs to 200, reduce batch_size.
+      - If get_formula() fails: ensure save_act=True and a forward pass is done first.
+      - If rollout diverges: check that KANDy receives normalised features.
+      Repeat until rollout RMSE is computed (even if high — document the result).
+
+    STEP 4 — Write report:
+      Save findings to outputs/kane_report.md including:
+      - Final loss values (train/val) for each latent_dim tried.
+      - Symbolic encoder formulas (or statement that extraction failed and why).
+      - Rollout RMSE comparison: KANELift vs PolynomialLift(2).
+      - K_ eigenvalue spectrum and interpretation.
+      - Recommended next steps to improve KANELift convergence.
   expected_output: >
-    Markdown audit report with one section per experiment:
-      - Algorithm compliance: correct lift, single-layer KAN, symbolic extraction
-      - Issues found with specific fixes (code snippets where helpful)
-    Followed by: proposed results/{system}/ directory structure and top-5 priority fixes.
-  agent: phd_student
+    outputs/kane_lorenz.py — complete, runnable experiment script.
+    outputs/kane_report.md — findings, RMSE table, symbolic formulas, eigenvalue analysis,
+    and concrete recommendations for improving KANELift.
+  agent: kane_researcher
 
-generate_new_results:
+fix_kuramoto_model:
   description: >
-    Write a complete, correct KANDy experiment script for {system}.
-    Algorithm: x_dot = A * Psi(phi(x)).
+    Fix the adaptive Kuramoto KANDy experiment to achieve correct rollout and symbolic extraction.
 
-    Steps:
-    1. DATA: Generate trajectory using solve_ivp or RK4. Fix random seed.
-    2. LIFT: Design phi(x) for {system}. Include ALL cross-interaction terms explicitly.
-       For Lorenz: phi = (x, y, z, x^2, x*y, x*z, y^2, y*z, z^2).
-       Document why each term is included (reference known equations).
-    3. DATASET: Compute theta=phi(x) for all snapshots.
-       Build {train_input: theta, train_label: x_dot, val_input:..., val_label:...,
-              test_input:..., test_label:...}.
-    4. TRAIN: model = KAN(width=[m, n], grid=g, k=k). model.fit(dataset, opt='LBFGS').
-       m=dim(phi), n=dim(x_dot). Log loss per step.
-    5. EXTRACT: model.auto_symbolic(). Get psi_i from model.symbolic_formula().
-       Print A from output weights. Round to 3 decimal places.
-    6. ROLLOUT: Integrate x_dot=A*Psi(phi(x)) with RK4. Compute RMSE and NRMSE.
-    7. FIGURES: Save loss curve, trajectory overlay, phase portrait as PNG+PDF in results/{system}/.
+    STEP 1 — Read and diagnose:
+      read_file('examples/adaptive_kuramoto_example.py') to understand the current implementation.
+      Use kandy_api_reference(topic='training') for the API.
+      Key issues to check:
+      - Is rollout_loss_fn=angle_mse passed to fit()? (angle wrapping is essential for phases)
+      - Does the lift explicitly encode sin(theta_j - theta_i) and cos(theta_j - theta_i) terms?
+      - Is base_fun=torch.sin used?
+
+    STEP 2 — Write fixed version:
+      Write the fixed experiment to outputs/kuramoto_fixed.py.
+      Required:
+      a) Generate data for N=5 oscillators, epsilon=0.1, T=4000 steps, dt=0.05.
+      b) Feature library: for each pair (i,j), include sin(theta_i-theta_j),
+         cos(theta_i-theta_j), kappa_ij. Also include omega_i. Total features documented.
+      c) Two separate KANDy models: one for phase (dtheta/dt), one for coupling (dkappa/dt).
+      d) Phase model: model.fit(X, X_dot_theta, rollout_loss_fn=angle_mse, rollout_weight=0.3,
+         base_fun=torch.sin, opt='LBFGS').
+      e) Coupling model: model.fit(X, X_dot_kappa, opt='LBFGS').
+      f) Rollout: integrate both models together for T=500 steps; compute RMSE for phases
+         and coupling weights separately.
+      g) Symbolic extraction via auto_symbolic_with_costs; print discovered equations.
+      h) Save figures to results/KuramotoFixed/.
+
+    STEP 3 — Run and iterate:
+      Run with run_python_script. Target: phase RMSE < 0.3 over T=500 steps.
+      Tune rollout_weight, lamb (sparsity), and grid if needed.
   expected_output: >
-    A complete runnable Python script for {system} that:
-      - Uses correct single-layer KAN with Koopman-lifted inputs
-      - Extracts and prints psi_i (SymPy) and A (numpy) symbolically
-      - Runs rollout and prints RMSE/NRMSE summary
-      - Saves all figures as PNG (300 dpi) + PDF in results/{system}/
-  agent: phd_student
+    outputs/kuramoto_fixed.py — complete fixed experiment script.
+    Console output showing phase RMSE, coupling RMSE, and discovered symbolic equations.
+  agent: kandy_researcher
+
+fix_ikeda_model:
+  description: >
+    Fix the Ikeda optical-cavity map KANDy experiment to achieve correct two-phase training
+    and rollout RMSE below 0.1 over 400 steps.
+
+    STEP 1 — Read and diagnose:
+      read_file('examples/ikeda_example.py').
+      Use kandy_api_reference(topic='training') for the rollout API.
+      Key issues to check:
+      - Is the discrete_rhs trick implemented correctly?
+        discrete_rhs(state) = map_fn(state) - state, Euler integrator, dt=1.
+      - Is make_windows used correctly to build the trajectory dataset?
+      - Are the 4 physics features [u*x*cos(t), u*y*cos(t), u*x*sin(t), u*y*sin(t)]
+        correctly normalised before passing to the KAN?
+
+    STEP 2 — Write fixed version:
+      Write to outputs/ikeda_fixed.py.
+      Required:
+      a) Generate 12000 steps (burn_in=2000), train/val/test split 64/16/20.
+      b) Physics lift (4 features), feature normalisation with train statistics.
+      c) Phase 1: model.fit(Theta_train_n, Y_train, opt='LBFGS', fit_steps=50).
+      d) Phase 2: build train_windows = make_windows(train_seq, window=HORIZON+1).
+         Call fit_kan(model.model_, dataset_roll, opt='LBFGS', steps=100,
+                      rollout_weight=0.6, rollout_horizon=15,
+                      dynamics_fn=discrete_rhs, integrator='euler').
+      e) Rollout 400 steps; compute and print RMSE.
+      f) auto_symbolic_with_costs with TRIG_LIB_CHEAP for all 4 features;
+         print discovered map equations.
+      g) Attractor overlay plot saved to results/IkedaFixed/.
+
+    STEP 3 — Run and iterate:
+      Target: RMSE < 0.1 over 400 steps. If higher, try:
+      - Increase Phase 1 fit_steps to 100.
+      - Increase rollout_horizon to 20.
+      - Try rollout_weight=0.8.
+  expected_output: >
+    outputs/ikeda_fixed.py — complete fixed experiment script.
+    Console output showing rollout RMSE and symbolic map equations.
+  agent: kandy_researcher
   context:
-    - clean_experimental_results
+    - fix_kuramoto_model
 
-develop_package_code:
+write_baselines:
   description: >
-    Design and implement the initial `kandy` Python package for the algorithm
-    x_dot = A * Psi(phi(x)).
+    Write SINDy and PDEFind baseline scripts for fair comparison with KANDy.
 
-    Required API:
-      lift = PolynomialLift(degree=2)   # or DelayEmbedding, or custom callable
-      model = KANDy(lift=lift, grid=5, k=3)
-      model.fit(X, X_dot)              # or model.fit(X_traj, dt=0.01)
-      A = model.get_A()                # numpy array (n x m)
-      formulas = model.get_formula()   # list of n SymPy expressions
-      X_pred = model.rollout(x0, T, dt)
+    STEP 1 — SINDy baselines (examples/sindy_baselines.py):
+      Write a single script covering four systems:
 
-    Constraints:
-      - KAN is always width=[m,n] internally. Do NOT expose depth as a parameter.
-      - PolynomialLift must include cross-products (x*y, x*z, etc.).
-      - get_formula() returns the full x_dot_i = sum_j A_ij * psi_j(phi_j(x)) expression.
+      (A) Lorenz-63 with ps.PolynomialLibrary(degree=2) + ps.STLSQ(threshold=0.05):
+          import pysindy as ps; import numpy as np
+          Generate same trajectory as KANDy (N=5000, dt=0.01, sigma=10, rho=28, beta=8/3).
+          Fit: model = ps.SINDy(...); model.fit(X, t=dt); print(model.equations())
+          Rollout: x_pred = model.simulate(x0, t); RMSE vs truth.
 
-    Deliver: package structure, kandy/core.py (KANDy class), kandy/lifts.py
-    (Lift ABC, PolynomialLift, DelayEmbedding), examples/henon_example.py,
-    tests/test_kandy.py (5+ test outlines), pyproject.toml snippet.
+      (B) Kuramoto (N=5 oscillators) with FourierLibrary + PolynomialLibrary(1):
+          trig_lib = ps.GeneralizedLibrary([ps.FourierLibrary(n_frequencies=1),
+                                            ps.PolynomialLibrary(degree=1)])
+          Use same data as the fixed Kuramoto experiment (context).
+
+      (C) Ikeda map with ps.SINDy(discrete_time=True, feature_library=ps.PolynomialLibrary(2)):
+          Fit on (x_n, y_n) → (x_{n+1}, y_{n+1}) pairs.
+          For trig features, use CustomLibrary with cos/sin of t(x,y).
+
+      (D) Lorenz comparison table: print RMSE side-by-side KANDy vs SINDy.
+
+    STEP 2 — PDEFind baseline (examples/pdefind_baseline.py):
+      Write a script for the inviscid Burgers equation.
+      Generate data with kandy's solve_burgers(u0, n_steps=1000, dt=0.005, scheme='roe').
+      Reshape to (t, x) spatiotemporal grid.
+      Fit with WeakPDELibrary targeting u_t = f(u, u_x, u_xx, u^2, u*u_x):
+          xt_grid = np.array(np.meshgrid(x_arr, t_arr)).T
+          library = ps.WeakPDELibrary(
+              function_library=ps.PolynomialLibrary(degree=2),
+              derivative_order=2,
+              spatiotemporal_grid=xt_grid,
+              K=500, num_pts_per_domain=50,
+          )
+          model = ps.SINDy(feature_library=library, optimizer=ps.STLSQ(threshold=0.05))
+          model.fit(u_data)
+          print(model.equations())
+      Report discovered PDE and RMSE of one-step prediction.
+
+    STEP 3 — Comparison table:
+      Write outputs/baselines/comparison_table.md with columns:
+      System | Method | Library | 1-step MSE | Rollout RMSE (T) | Equation recovered | Time(s)
+      Run all scripts; populate table with actual numbers.
   expected_output: >
-    Package design document and implementation:
-      - Annotated directory tree
-      - kandy/core.py: KANDy class (single-layer KAN enforced, type-annotated, docstrings)
-      - kandy/lifts.py: Lift ABC, PolynomialLift with cross-products, DelayEmbedding
-      - examples/henon_example.py: full pipeline demo
-      - tests/test_kandy.py: 5+ test outlines
-      - pyproject.toml deps (pykan, torch, scipy, sympy)
-      - Brief rationale for why KAN depth is fixed at 1
-  agent: professional_coder
+    examples/sindy_baselines.py — complete, runnable SINDy baseline script.
+    examples/pdefind_baseline.py — complete, runnable PDEFind baseline script.
+    outputs/baselines/comparison_table.md — filled comparison table.
+  agent: baseline_researcher
+
+advisor_feedback:
+  description: >
+    Read every Phase 1 output file and write concise, actionable feedback for each
+    research agent — the kind of notes a PhD advisor would leave after reading
+    a student's lab notebook.
+
+    Files to read (use read_file for each that exists):
+      outputs/kane_report.md
+      outputs/kuramoto_fixed.py
+      outputs/ikeda_fixed.py
+      outputs/baselines/comparison_table.md
+
+    For EACH agent produce exactly THREE bullets:
+      ✓ What was done well (one specific thing)
+      ✗ The single most important problem or missed target
+      → One concrete action to take differently next run
+
+    Keep total length under one page.  No academic prose — bullet points only.
+    End with a one-sentence priority order for the next run.
+  expected_output: >
+    outputs/advisor_feedback.md — one-page bullet-point feedback document
+    with a section for each of the four research agents and a final priority line.
+  agent: journal_reviewer
   context:
-    - clean_experimental_results
+    - research_kane_lift
+    - fix_kuramoto_model
+    - fix_ikeda_model
+    - write_baselines
+
+write_run_report:
+  description: >
+    After all research tasks complete, read every output file and write a plain-language
+    Run Report documenting exactly what worked and what didn't in this run.
+
+    Read these files before writing (use read_file for each):
+      outputs/kane_report.md
+      outputs/kuramoto_fixed.py
+      outputs/ikeda_fixed.py
+      outputs/baselines/comparison_table.md
+
+    Structure the report in THREE sections:
+
+    ## What Worked
+    - List each experiment or script that ran to completion without errors.
+    - For each success: state the key metric achieved (RMSE, R², equation recovered Y/N).
+    - Explicitly note when a target was met (e.g. "Ikeda RMSE = 0.07 < target 0.1 ✓").
+
+    ## What Didn't Work
+    - List each failure: crashed scripts, unmet targets, divergent training, missing files.
+    - For each failure provide: (a) the symptom observed, (b) the most likely root cause,
+      (c) one concrete fix to try in the next run.
+    - If an output file is missing entirely, note that the task did not complete.
+
+    ## Top 3 Next Steps
+    Prioritise the three highest-impact fixes or experiments to attempt in the next run,
+    ordered by expected return on time invested.
+  expected_output: >
+    outputs/run_report.md — a concise (1-2 page) plain-language report with exactly
+    the three sections above. No academic prose; bullet points preferred.
+  agent: journal_reviewer
+  context:
+    - research_kane_lift
+    - fix_kuramoto_model
+    - fix_ikeda_model
+    - write_baselines
+    - advisor_feedback
 
 review_results:
   description: >
-    Write a formal peer review of the KANDy research for {system} as a referee
-    at JCP, SIADS, or NeurIPS. Evaluate:
+    Write a formal peer review of the KANDy research paper based on all experimental
+    results from the KANE lift, fixed Kuramoto/Ikeda, and SINDy/PDEFind baselines.
 
-    1. NOVELTY: How does x_dot=A*Psi(phi(x)) advance beyond SINDy (fixed dict + LASSO),
-       EDMD (Psi_dot=K*Psi), and neural ODEs (black-box)?
-    2. THEORY: Are the bilinear obstruction proof and non-injectivity argument rigorous?
-    3. LIFT DESIGN: Is phi well-motivated per benchmark? Could simpler lifts work?
-    4. EXPERIMENTS: Are SINDy and EDMD baselines present? Noise robustness tested?
-    5. SYMBOLIC RECOVERY: Are formulas exact? When does extraction succeed/fail?
-    6. PACKAGE: Does the API correctly enforce single-layer KAN and explicit lift design?
-    7. LIMITATIONS: What should be honestly stated (lift requires domain knowledge, etc.)?
+    Read all output files before writing:
+      read_file('outputs/run_report.md')
+      read_file('outputs/kane_report.md')
+      read_file('outputs/baselines/comparison_table.md')
+
+    Evaluate:
+    1. NOVELTY: How does x_dot=A*Psi(phi(x)) advance beyond SINDy, EDMD, and neural ODEs?
+       Does the KANELift represent a meaningful advance (learned lift vs hand-designed)?
+    2. THEORY: Are the bilinear obstruction proof and non-injectivity argument rigorous
+       and are they actually needed to justify KANDy?
+    3. EXPERIMENTS: Are SINDy and PDEFind baselines set up fairly (same data, same noise)?
+       Are the Kuramoto angle-wrapping and Ikeda two-phase training improvements meaningful?
+    4. SYMBOLIC RECOVERY: When does it succeed (Lorenz, Ikeda) vs fail (Kuramoto)? Why?
+    5. LIMITATIONS: What should be stated honestly — lift requires domain knowledge,
+       KANELift is experimental, scalability to high-dimensional systems?
+    6. RECOMMENDATION and top-3 highest-impact action items.
   expected_output: >
-    Formal referee report in markdown (saved to outputs/review.md):
-      - Contribution summary (3-4 sentences)
-      - Major concerns (numbered, each with remedy)
-      - Minor concerns (numbered)
-      - Comments on proofs and experimental figures
-      - Recommendation (Accept / Minor Revision / Major Revision / Reject)
-      - Top-3 highest-impact action items
+    outputs/review.md — formal referee report in markdown with:
+    - Contribution summary (3-4 sentences)
+    - Major concerns (numbered, each with remedy)
+    - Minor concerns (numbered)
+    - Comparison table commentary
+    - Recommendation (Accept / Minor Revision / Major Revision / Reject)
+    - Top-3 action items
   agent: journal_reviewer
   context:
-    - generate_new_results
-    - develop_package_code
+    - research_kane_lift
+    - fix_kuramoto_model
+    - fix_ikeda_model
+    - write_baselines
+    - advisor_feedback
+    - write_run_report

@@ -8,23 +8,27 @@ from kandy.crew import Kandy
 
 warnings.filterwarnings("ignore", category=SyntaxWarning, module="pysbd")
 
-# Supported systems (maps to research_code/ experiments):
-#   'Lorenz'               — Lorenz (3).ipynb
-#   'Henon'                — henon.py
-#   'Burgers'              — Inviscid_Burgers (1).ipynb
-#   'Burgers-Fourier'      — Inviscd-Burgers-fourier-mode-ics.ipynb
-#   'Kuramoto-Sivashinsky' — Kuramoto–Sivashinsky (1).ipynb
-#   'Navier-Stokes'        — Navier-Stokes.ipynb
-#   'Hopf'                 — hopf.ipynb
-
+# ---------------------------------------------------------------------------
+# Default inputs
+# ---------------------------------------------------------------------------
 INPUTS = {
-    'system': 'Lorenz',
     'current_year': str(datetime.now().year),
 }
 
 
+# ---------------------------------------------------------------------------
+# Entry points
+# ---------------------------------------------------------------------------
+
 def run():
-    """Run the full KANDy research crew (clean → generate → package → review)."""
+    """Run the full KANDy research crew.
+
+    Workstreams (parallel, hierarchical):
+      1. kane_researcher  — KANE lift (deep Koopman + KAN autoencoder) on Lorenz
+      2. kandy_researcher — fix Kuramoto and Ikeda KANDy experiments
+      3. baseline_researcher — SINDy and PDEFind baselines
+      4. journal_reviewer — synthesis review (waits for 1-3)
+    """
     try:
         Kandy().crew().kickoff(inputs=INPUTS)
     except Exception as e:
@@ -68,19 +72,14 @@ def run_with_trigger():
     import json
 
     if len(sys.argv) < 2:
-        raise Exception("No trigger payload provided. Please provide JSON payload as argument.")
+        raise Exception("No trigger payload provided.  Pass JSON as argument.")
 
     try:
         trigger_payload = json.loads(sys.argv[1])
     except json.JSONDecodeError:
-        raise Exception("Invalid JSON payload provided as argument.")
+        raise Exception("Invalid JSON payload.")
 
-    inputs = {
-        **INPUTS,
-        "crewai_trigger_payload": trigger_payload,
-        # Override system from payload if provided
-        "system": trigger_payload.get("system", INPUTS["system"]),
-    }
+    inputs = {**INPUTS, "crewai_trigger_payload": trigger_payload}
 
     try:
         return Kandy().crew().kickoff(inputs=inputs)

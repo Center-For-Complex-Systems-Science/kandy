@@ -103,7 +103,9 @@ N_FEATURES = 4
 PHYSICS_IDX = set(range(N_FEATURES))
 
 
-def build_ikeda_features_np(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+def _ikeda_features_np(X: np.ndarray) -> np.ndarray:
+    """NumPy: (N, 2) → (N, 4) physics-informed features."""
+    x, y = X[:, 0], X[:, 1]
     r2 = x * x + y * y
     q  = 1.0 / (1.0 + r2)
     t  = 0.4 - 6.0 * q
@@ -116,9 +118,9 @@ def build_ikeda_features_np(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     ]).astype(np.float32)
 
 
-def build_ikeda_features_torch(state_xy: torch.Tensor) -> torch.Tensor:
-    """Torch version for gradient-compatible rollout."""
-    x, y = state_xy[:, 0], state_xy[:, 1]
+def _ikeda_features_torch(X: torch.Tensor) -> torch.Tensor:
+    """Torch: (B, 2) → (B, 4) physics-informed features (gradient-compatible)."""
+    x, y = X[:, 0], X[:, 1]
     r2 = x * x + y * y
     q  = 1.0 / (1.0 + r2)
     t  = 0.4 - 6.0 * q
@@ -131,7 +133,14 @@ def build_ikeda_features_torch(state_xy: torch.Tensor) -> torch.Tensor:
     ], dim=1)
 
 
-Theta_np = build_ikeda_features_np(X_state[:, 0], X_state[:, 1])
+ikeda_lift = CustomLift(
+    fn=_ikeda_features_np,
+    torch_fn=_ikeda_features_torch,
+    output_dim=N_FEATURES,
+    name="ikeda_lift",
+)
+
+Theta_np = ikeda_lift(X_state)
 
 # ---------------------------------------------------------------------------
 # 3. Train / val / test split and feature normalisation
@@ -172,7 +181,7 @@ feat_std_t  = torch.tensor(feat_std,  dtype=torch.float32, device=DEVICE)
 
 def map_fn_torch(state_xy: torch.Tensor) -> torch.Tensor:
     """Apply learned map: Theta(state) → normalise → KAN → next state."""
-    Theta = build_ikeda_features_torch(state_xy)
+    Theta = ikeda_lift.torch_fn(state_xy)
     Theta_n = (Theta - feat_mean_t) / feat_std_t
     return model.model_(Theta_n)   # (B, 2)
 
@@ -196,8 +205,6 @@ t_window = torch.arange(window, dtype=torch.float32, device=DEVICE)   # dt=1 eac
 # ---------------------------------------------------------------------------
 # 5. KANDy model — KAN = [4, 2], base_fun = RBF
 # ---------------------------------------------------------------------------
-ikeda_lift = CustomLift(fn=lambda X: X, output_dim=N_FEATURES, name="ikeda_lift")
-
 model = KANDy(
     lift=ikeda_lift,
     grid=5,
@@ -319,7 +326,7 @@ print(f"[TRUE] y_{{n+1}} =     u*(x*sin(t) + y*cos(t))")
 # ---------------------------------------------------------------------------
 
 def map_fn_np(state_np: np.ndarray) -> np.ndarray:
-    theta = build_ikeda_features_np(state_np[:, 0], state_np[:, 1])
+    theta = ikeda_lift(state_np)
     theta_n = (theta - feat_mean) / feat_std
     t = torch.tensor(theta_n, dtype=torch.float32, device=DEVICE)
     with torch.no_grad():
