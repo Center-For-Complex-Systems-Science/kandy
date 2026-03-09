@@ -237,12 +237,13 @@ def fit_sech2(
     x0_0 = x[np.argmin(y)]
     ell0 = np.std(x) / 5.0 or 1.0
     p0 = [a0, A0, x0_0, ell0]
-    bounds = ([-np.inf, -np.inf, x.min(), 1e-6],
-              [ np.inf,  np.inf, x.max(), np.inf])
+    bounds = ([-np.inf, -np.inf, x.min() - 1e-6, 1e-6],
+              [ np.inf,  np.inf, x.max() + 1e-6, np.inf])
+    p0 = [np.clip(p, lo + 1e-8, hi - 1e-8) for p, lo, hi in zip(p0, bounds[0], bounds[1])]
 
     try:
         params, _ = curve_fit(_model, x, y, p0=p0, bounds=bounds, maxfev=200_000)
-    except RuntimeError:
+    except (RuntimeError, ValueError):
         params = np.array(p0)
 
     y_hat = _model(x, *params)
@@ -276,12 +277,14 @@ def fit_sech2_tanh(
     ell0 = np.std(x) / 8.0 or 1.0
     K0 = np.sign(np.corrcoef(x - x0_0, y_centered)[0, 1] + 1e-12) * np.ptp(y)
     p0 = [c0, K0, x0_0, ell0]
-    bounds = ([-np.inf, -np.inf, x.min(), 1e-6],
-              [ np.inf,  np.inf, x.max(), np.inf])
+    bounds = ([-np.inf, -np.inf, x.min() - 1e-6, 1e-6],
+              [ np.inf,  np.inf, x.max() + 1e-6, np.inf])
+    # Clamp initial guess to be inside bounds
+    p0 = [np.clip(p, lo + 1e-8, hi - 1e-8) for p, lo, hi in zip(p0, bounds[0], bounds[1])]
 
     try:
         params, _ = curve_fit(_model, x, y, p0=p0, bounds=bounds, maxfev=200_000)
-    except RuntimeError:
+    except (RuntimeError, ValueError):
         params = np.array(p0)
 
     y_hat = _model(x, *params)

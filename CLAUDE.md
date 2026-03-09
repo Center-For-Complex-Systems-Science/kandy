@@ -6,18 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 # Install dependencies
-crewai install        # or: uv sync
+uv sync
 
-# Run the full research crew
-crewai run            # or: uv run kandy
+# Run a KANDy experiment
+uv run kandy <system>           # e.g. uv run kandy lorenz
+uv run kandy --list             # list available systems
 
-# Target a specific dynamical system (edit INPUTS in main.py first)
-# Supported: Lorenz, Henon, Burgers, Burgers-Fourier, Kuramoto-Sivashinsky, Navier-Stokes, Hopf
+# Run baseline comparisons
+uv run kandy-baselines <name>   # e.g. uv run kandy-baselines burgers-fourier
+uv run kandy-baselines --list   # list available baselines
 
-# Other entry points
-uv run train <n_iterations> <output_filename>
-uv run replay <task_id>
-uv run test <n_iterations> <eval_llm>
+# Run research scripts directly
+uv run python research_code/burgers_fourier_baselines.py
 ```
 
 ## Algorithm
@@ -26,9 +26,9 @@ KANDy (Kolmogorov-Arnold Networks for Dynamics) is a reimplementation of SINDy w
 sparse regression is replaced by a KAN and inputs are Koopman-lifted coordinates.
 
 **The model:** `x_dot = A * Psi(phi(x))`
-- `phi(x) = theta` — Koopman lift (user-designed; encodes cross-terms like x*y explicitly)
-- `Psi(theta)` — separable spline map, `psi_i(theta_i)`, learned by a **single-layer** KAN
-- `A` — learned linear mixing matrix (n × m)
+- `phi(x) = theta` -- Koopman lift (user-designed; encodes cross-terms like x*y explicitly)
+- `Psi(theta)` -- separable spline map, `psi_i(theta_i)`, learned by a **single-layer** KAN
+- `A` -- learned linear mixing matrix (n x m)
 
 **Critical constraints:**
 - The KAN is always `width=[m, n]` (one hidden layer). Standard deep KANs cannot
@@ -43,39 +43,47 @@ sparse regression is replaced by a KAN and inputs are Koopman-lifted coordinates
 4. Extract `A` (output weights) and `psi_i` (splines) symbolically via `auto_symbolic()`
 5. Validate: autoregressive rollout with RK4, compute RMSE/NRMSE
 
+## Project Structure
+
+### Package (`src/kandy/`)
+Pip-installable library with modular components:
+- `core.py` -- `KANDy` class: fit, predict, rollout, get_formula, score_formula
+- `lifts.py` -- Lift classes: PolynomialLift, CustomLift, FourierLift, KANELift, etc.
+- `training.py` -- `fit_kan`, `rk4_step`, `make_windows`, `angle_mse`
+- `symbolic.py` -- `auto_symbolic_with_costs`, `score_formula`, `formulas_to_latex`
+- `numerics.py` -- PDE solvers: `solve_burgers`, `fv_rhs`, Rusanov/Roe/HLLC fluxes
+- `plotting.py` -- Publication plots: `plot_all_edges`, `plot_attractor_overlay`, `plot_loss_curves`, `plot_trajectory_error`, `use_pub_style`
+- `main.py` -- CLI entry points
+
 ### Research code (`research_code/`)
-Raw experimental notebooks and scripts. Each implements the KANDy pipeline:
-- `henon.py` — Hénon map (discrete, 2D; lift includes x²)
-- `hopf.ipynb` — Hopf fibration (S³ → S², topological)
-- `Lorenz (3).ipynb` — Lorenz ODE (lift must include xy, xz)
-- `Inviscid_Burgers (1).ipynb` — Burgers equation (lift includes u, u_x, u²)
-- `Inviscd-Burgers-fourier-mode-ics.ipynb` — Burgers with Fourier-mode ICs
-- `Kuramoto–Sivashinsky (1).ipynb` — KS PDE (lift includes u, u_x, u_xx, u_xxxx)
-- `Navier-Stokes.ipynb` — 3D incompressible N-S
+Raw experimental notebooks and scripts:
+- `henon.py` -- Henon map (discrete, 2D; lift includes x^2)
+- `hopf.ipynb` -- Hopf fibration (S^3 -> S^2, topological)
+- `Lorenz (3).ipynb` -- Lorenz ODE (lift must include xy, xz)
+- `Inviscid_Burgers (1).ipynb` -- Burgers equation (lift includes u, u_x, u^2)
+- `Inviscd-Burgers-fourier-mode-ics.ipynb` -- Burgers with Fourier-mode ICs
+- `Kuramoto-Sivashinsky (1).ipynb` -- KS PDE (lift includes u, u_x, u_xx, u_xxxx)
+- `Navier-Stokes.ipynb` -- 3D incompressible N-S
+- `burgers_fourier_baselines.py` -- SINDy/PDE-FIND baselines for Burgers
 
-### 2. crewAI automation (`src/kandy/`)
-A multi-agent system that automates research tasks. Uses **hierarchical process**.
+### Examples (`examples/`)
+Clean example scripts for each dynamical system, plus SINDy/PDEFind baselines.
 
-**Agent hierarchy:**
-- `phd_advisor` — Manager agent (not decorated with `@agent`); directs the crew
-- `phd_student` — Cleans existing experiments and generates new ones
-- `professional_coder` — Designs and builds the pip-installable `kandy` package
-- `journal_reviewer` — Produces a formal referee report on results
+### Results (`results/`)
+All research outputs (plots, reports, data) go here, organized by system name.
 
-**Task flow** (PhD Advisor delegates dynamically):
-1. `clean_experimental_results` → phd_student → `outputs/audit_report.md`
-2. `generate_new_results` → phd_student → `outputs/experiment_{system}.py`
-3. `develop_package_code` → professional_coder → `outputs/package_design.md`
-4. `review_results` → journal_reviewer → `outputs/review.md`
+### Agent orchestration
+Research automation (running experiments, reviewing results, generating reports) is
+handled by **Claude Code agents**, not an in-process framework. Claude Code spawns
+subagents to run experiments, use multimodal to review plots, and write reports.
 
-**Key files:**
-- `src/kandy/config/agents.yaml` — Agent role, goal, backstory
-- `src/kandy/config/tasks.yaml` — Task descriptions, expected outputs, context dependencies
-- `src/kandy/crew.py` — Wires agents and tasks; `phd_advisor()` is passed as `manager_agent`
-- `src/kandy/main.py` — Entry points; `INPUTS['system']` controls the target benchmark
+## Output conventions
+- All research results go to `results/<SystemName>/` (plots as PNG+PDF at 300 dpi)
+- Baseline comparisons go to `results/<SystemName>/baselines/`
+- Reports include discovered equations in clean symbolic format
+- Use `kandy.plotting.use_pub_style()` for publication-quality figures
 
 ### Environment
-- `.env`: `MODEL` and `ANTHROPIC_API_KEY` (Anthropic Claude)
-- Python 3.10–3.13, package manager: **uv**
+- Python 3.11-3.13, package manager: **uv**
 - Core research dependencies: `pykan`, `torch`, `scipy`, `sympy`, `matplotlib`
-- crewAI dependency: `crewai[tools]==1.9.3`
+- Baseline dependencies: `pysindy`, `scikit-learn`

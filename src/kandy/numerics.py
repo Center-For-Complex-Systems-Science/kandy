@@ -49,6 +49,8 @@ __all__ = [
     "superbee",
     # MUSCL reconstruction
     "muscl_reconstruct",
+    # spectral derivatives
+    "spectral_derivative",
     # numerical fluxes
     "rusanov_flux",
     "roe_flux",
@@ -175,6 +177,81 @@ def muscl_reconstruct(
     u_R = np.roll(u - 0.5 * dx * slope, -1)  # left edge of cell i+1
 
     return u_L, u_R
+
+
+# ---------------------------------------------------------------------------
+# Spectral (Fourier) derivative
+# ---------------------------------------------------------------------------
+
+def spectral_derivative(
+    u: np.ndarray,
+    domain_length: float = 2.0 * np.pi,
+    order: int = 1,
+    filter_order: int = 0,
+    filter_cutoff: float = 0.667,
+) -> np.ndarray:
+    """Compute the spatial derivative of u on a uniform periodic grid via FFT.
+
+    For a periodic domain [0, L) with N equally spaced points, this computes
+    the exact derivative of the trigonometric interpolant:
+
+        d^n u / dx^n  =  IFFT( (i k)^n  FFT(u) )
+
+    where k is the angular wavenumber.  The Nyquist mode is zeroed for
+    odd-order derivatives to avoid aliasing artefacts.
+
+    An optional exponential filter suppresses Gibbs oscillations near shocks:
+
+        σ(η) = exp(-α η^p)     where η = |k| / k_max
+
+    with ``p = filter_order`` and α chosen so σ(1) = machine epsilon.
+    Set ``filter_order=0`` (default) for no filtering.
+
+    Parameters
+    ----------
+    u : np.ndarray, shape (N,)
+        Function values on a uniform periodic grid.
+    domain_length : float
+        Physical domain length L (default 2π).
+    order : int
+        Derivative order (default 1).
+    filter_order : int
+        Exponential filter order p (default 0 = no filter).
+        Typical values: 8–16 for mild smoothing, 4–6 for strong smoothing.
+    filter_cutoff : float
+        Fraction of modes to keep unfiltered (default 2/3).
+        Modes with |k|/k_max < filter_cutoff are untouched;
+        modes above are smoothly damped.
+
+    Returns
+    -------
+    du : np.ndarray, shape (N,)
+        The ``order``-th derivative evaluated at the grid points.
+    """
+    N = len(u)
+    dx = domain_length / N
+    k = 2.0 * np.pi * np.fft.fftfreq(N, d=dx)   # angular wavenumber
+    u_hat = np.fft.fft(u)
+    deriv_hat = u_hat * (1j * k) ** order
+
+    # Zero Nyquist mode for odd-order derivatives (antisymmetric)
+    if order % 2 == 1:
+        deriv_hat[N // 2] = 0
+
+    # Optional exponential filter
+    if filter_order > 0:
+        k_max = np.max(np.abs(k))
+        eta = np.abs(k) / (k_max + 1e-30)
+        # Apply filter only above the cutoff fraction
+        alpha = -np.log(np.finfo(float).eps)  # ~36.04
+        sigma = np.where(
+            eta <= filter_cutoff,
+            1.0,
+            np.exp(-alpha * ((eta - filter_cutoff) / (1.0 - filter_cutoff)) ** filter_order),
+        )
+        deriv_hat *= sigma
+
+    return np.real(np.fft.ifft(deriv_hat))
 
 
 # ---------------------------------------------------------------------------

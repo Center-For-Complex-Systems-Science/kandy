@@ -119,6 +119,7 @@ class KANDy:
         lr: float = 1.0,
         batch: int = -1,
         fit_steps: Optional[int] = None,
+        patience: int = 10,
         verbose: bool = True,
     ) -> "KANDy":
         """Fit the KANDy model.
@@ -154,6 +155,8 @@ class KANDy:
             (e.g., Kuramoto), or any ``(pred, true) -> scalar`` callable.
         fit_steps : int, optional
             Override ``self.steps`` for this call.
+        patience : int
+            Early stopping patience (default 10). Set to 0 to disable.
         verbose : bool
             Print training progress.
 
@@ -161,6 +164,10 @@ class KANDy:
         -------
         self
         """
+        # PyKAN's .to(device) does not reliably move internal spline grids
+        # to CUDA, causing device-mismatch errors in B_batch. Force CPU.
+        self.device = torch.device("cpu")
+
         self._set_seeds()
         steps = fit_steps if fit_steps is not None else self.steps
 
@@ -226,7 +233,7 @@ class KANDy:
         if self.base_fun is not None:
             kan_kwargs["base_fun"] = self.base_fun
 
-        self.model_ = KAN(**kan_kwargs).to(self.device)
+        self.model_ = KAN(**kan_kwargs)
 
         self.train_results_ = fit_kan(
             self.model_,
@@ -238,6 +245,7 @@ class KANDy:
             lamb=lamb,
             rollout_weight=rollout_weight,
             rollout_loss_fn=rollout_loss_fn,
+            patience=patience,
         )
 
         self._train_input = dataset["train_input"]
