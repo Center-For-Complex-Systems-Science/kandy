@@ -54,7 +54,7 @@ N_X   = 128
 DT    = 0.004
 N_T   = 2_500    # steps per trajectory
 BURN  = 200
-N_IC  = 20       # number of random initial conditions
+N_IC  = 5        # number of random initial conditions
 K_MAX = 5        # max Fourier mode
 
 x_grid = np.linspace(0, L, N_X, endpoint=False)
@@ -120,10 +120,21 @@ for ic_idx in range(N_IC):
     Theta_list.append(Th)
     Ut_list.append(Ut)
 
-Theta   = np.vstack(Theta_list).astype(np.float32)   # (N_IC * T * N_x, 3)
-U_t_all = np.vstack(Ut_list).astype(np.float32)       # same shape, 1 col
+Theta_full   = np.vstack(Theta_list).astype(np.float32)
+U_t_full     = np.vstack(Ut_list).astype(np.float32)
 
-print(f"[DATA]  Total samples: {len(Theta)} (from {N_IC} trajectories)")
+# Subsample to avoid memory/numerical issues with PyKAN LBFGS + grid updates
+MAX_SAMPLES = 100_000
+if len(Theta_full) > MAX_SAMPLES:
+    rng = np.random.default_rng(SEED)
+    idx = rng.choice(len(Theta_full), MAX_SAMPLES, replace=False)
+    Theta   = Theta_full[idx]
+    U_t_all = U_t_full[idx]
+    print(f"[DATA]  Subsampled {MAX_SAMPLES} from {len(Theta_full)} total (from {N_IC} trajectories)")
+else:
+    Theta   = Theta_full
+    U_t_all = U_t_full
+    print(f"[DATA]  Total samples: {len(Theta)} (from {N_IC} trajectories)")
 
 # ---------------------------------------------------------------------------
 # 4. KANDy model  (KAN = [3, 1])
@@ -146,6 +157,7 @@ model.fit(
     val_frac=0.15,
     test_frac=0.15,
     lamb=0.0,
+    patience=0,
     verbose=True,
 )
 
@@ -170,15 +182,38 @@ Ut_pred = model.predict(Th_test)
 mse     = np.mean((Ut_pred - Ut_test) ** 2)
 print(f"\n[EVAL]  Held-out IC test MSE: {mse:.6e}   RMSE: {mse**0.5:.6e}")
 
-# Rollout on held-out IC
-def rollout_burgers(u0: np.ndarray, n_steps: int, dt: float) -> np.ndarray:
-    u = u0.copy()
-    traj = [u.copy()]
+# Rollout on held-out IC — SSP-RK3 with CFL substeps (same as baselines)
+def kandy_rhs(u):
+    """Compute u_t = KANDy(phi(u)) for spatial field u (1, N_x)."""
+    u_1d = u.ravel()
+    th = np.column_stack([u_1d, tvd_deriv(u_1d), tvd_deriv(0.5 * u_1d**2)])
+    return model.predict(th).ravel().reshape(u.shape)
+
+
+def ssp_rk3_step(u, h, rhs_fn):
+    k1 = rhs_fn(u)
+    u1 = u + h * k1
+    k2 = rhs_fn(u1)
+    u2 = 0.75 * u + 0.25 * (u1 + h * k2)
+    k3 = rhs_fn(u2)
+    return (1.0 / 3.0) * u + (2.0 / 3.0) * (u2 + h * k3)
+
+
+def rollout_burgers(u0: np.ndarray, n_steps: int, dt: float,
+                    cfl: float = 0.35) -> np.ndarray:
+    u = u0[np.newaxis, :].copy()
+    traj = [u0.copy()]
     for _ in range(n_steps - 1):
-        th = np.column_stack([u, tvd_deriv(u), tvd_deriv(0.5 * u**2)])
-        u_t = model.predict(th).ravel()
-        u = u + dt * u_t
-        traj.append(u.copy())
+        umax = np.max(np.abs(u)) + 1e-12
+        h_hyp = cfl * dx / umax
+        n_sub = max(1, int(np.ceil(dt / h_hyp)))
+        h = dt / n_sub
+        for _ in range(n_sub):
+            u = ssp_rk3_step(u, h, kandy_rhs)
+            if np.any(np.isnan(u)):
+                traj.append(np.full_like(u0, np.nan))
+                return np.array(traj)
+        traj.append(u.ravel().copy())
     return np.array(traj)
 
 
@@ -195,7 +230,8 @@ print(f"[EVAL]  Rollout RMSE (T={N_ROLL}, held-out IC): {rmse_roll:.6f}")
 # 7. Figures
 # ---------------------------------------------------------------------------
 use_pub_style()
-os.makedirs("results/BurgersFourier", exist_ok=True)
+RESULTS = "results/Burgers-Fourier"
+os.makedirs(RESULTS, exist_ok=True)
 
 # 7a. Space-time heatmaps
 fig, axes = plt.subplots(1, 2, figsize=(10, 4))
@@ -211,8 +247,8 @@ for ax, data, title in zip(axes,
 fig.colorbar(im, ax=axes, label="u(x,t)")
 fig.suptitle("Burgers (Fourier ICs)", fontsize=12)
 fig.tight_layout()
-fig.savefig("results/BurgersFourier/spacetime.png", dpi=300, bbox_inches="tight")
-fig.savefig("results/BurgersFourier/spacetime.pdf", dpi=300, bbox_inches="tight")
+fig.savefig(f"{RESULTS}/spacetime.png", dpi=300, bbox_inches="tight")
+fig.savefig(f"{RESULTS}/spacetime.pdf", dpi=300, bbox_inches="tight")
 plt.close(fig)
 
 # 7b. Edge activations — highlight the sech² / sech²·tanh shapes
@@ -222,35 +258,32 @@ train_t = torch.tensor(Theta[sub_idx], dtype=torch.float32)
 
 # Edge: d(u²/2)/dx → u_t  (should be approximately linear, coeff ≈ -1)
 x_e, y_e = get_edge_activation(model.model_, l=0, i=2, j=0, X=train_t)
-lin_fit   = fit_linear(x_e, y_e)
-sech_fit  = fit_sech2(x_e, y_e)
 fig, ax = plot_edge(
-    x_e, y_e, fits=[lin_fit, sech_fit],
+    x_e, y_e, fits=["linear", "sech2"],
     title="Burgers-Fourier: edge (d(u²/2)/dx → u_t)",
     xlabel="d(u²/2)/dx", ylabel="u_t contribution",
-    save="results/BurgersFourier/edge_flux",
+    save=f"{RESULTS}/edge_flux",
 )
 plt.close(fig)
 
-# Edge: u·u_x edge (i=0,i=1 combined) via u_x → u_t
+# Edge: u_x → u_t
 x_e2, y_e2 = get_edge_activation(model.model_, l=0, i=1, j=0, X=train_t)
-sech2_tanh  = fit_sech2_tanh(x_e2, y_e2)
 fig, ax = plot_edge(
-    x_e2, y_e2, fits=[fit_linear(x_e2, y_e2), sech2_tanh],
+    x_e2, y_e2, fits=["linear", "sech2_tanh"],
     title="Burgers-Fourier: edge (u_x → u_t)",
     xlabel="u_x", ylabel="u_t contribution",
-    save="results/BurgersFourier/edge_ux",
+    save=f"{RESULTS}/edge_ux",
 )
 plt.close(fig)
 
-# All edges
-fig = plot_all_edges(
+# All edges grid
+fig, axes = plot_all_edges(
     model.model_,
     X=train_t,
-    input_names=FEATURE_NAMES,
-    output_names=["u_t"],
-    title="Burgers-Fourier KAN edge activations",
-    save="results/BurgersFourier/edge_activations",
+    fits=["linear"],
+    in_var_names=FEATURE_NAMES,
+    out_var_names=["u_t"],
+    save=f"{RESULTS}/edge_activations",
 )
 plt.close(fig)
 
@@ -258,9 +291,8 @@ plt.close(fig)
 if hasattr(model, "train_results_") and model.train_results_:
     fig, ax = plot_loss_curves(
         model.train_results_,
-        title="Burgers-Fourier training loss",
-        save="results/BurgersFourier/loss_curves",
+        save=f"{RESULTS}/loss_curves",
     )
     plt.close(fig)
 
-print("[FIGS]  Saved results/BurgersFourier/")
+print(f"[FIGS]  Saved {RESULTS}/")

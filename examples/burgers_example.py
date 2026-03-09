@@ -51,7 +51,7 @@ L    = 2.0 * np.pi
 N_X  = 128           # spatial grid points
 DT   = 0.005         # time step
 N_T  = 3_000         # total time steps
-BURN = 300           # transient
+BURN = 100           # transient (include shock formation)
 
 x_grid = np.linspace(0, L, N_X, endpoint=False)
 dx     = L / N_X
@@ -74,10 +74,9 @@ print(f"[DATA]  T={T_snap} snapshots, N_x={N_X}")
 # ---------------------------------------------------------------------------
 
 def tvd_derivative(u: np.ndarray) -> np.ndarray:
-    """First derivative via minmod-limited MUSCL slopes."""
-    # muscl_reconstruct returns the slope * dx/2; recover slope / dx
-    u_L, _ = muscl_reconstruct(u, dx, limiter="minmod")
-    return (u_L - u) * 2.0 / dx   # = slope (units: [u]/[x])
+    """First derivative via superbee-limited MUSCL slopes (less diffusive)."""
+    u_L, _ = muscl_reconstruct(u, dx, limiter="superbee")
+    return (u_L - u) * 2.0 / dx
 
 
 FEATURE_NAMES = ["u", "u_x", "d(u²/2)/dx"]
@@ -103,7 +102,16 @@ print("[DATA]  Building feature library ...")
 Theta   = build_burgers_library(U_inner)               # (T_inner * N_x, 3)
 U_t_flat = U_dot.ravel()[:, None]                      # (T_inner * N_x, 1)
 
-print(f"[DATA]  Theta shape: {Theta.shape}")
+# Subsample for PyKAN (LBFGS + grid updates struggle with >100K samples)
+MAX_SAMPLES = 80_000
+if len(Theta) > MAX_SAMPLES:
+    rng = np.random.default_rng(SEED)
+    idx = rng.choice(len(Theta), MAX_SAMPLES, replace=False)
+    Theta    = Theta[idx]
+    U_t_flat = U_t_flat[idx]
+    print(f"[DATA]  Subsampled to {MAX_SAMPLES} from {len(Theta)} total")
+else:
+    print(f"[DATA]  Theta shape: {Theta.shape}")
 
 # ---------------------------------------------------------------------------
 # 3. KANDy model  (KAN=[3, 1])
@@ -124,6 +132,7 @@ model.fit(
     val_frac=0.15,
     test_frac=0.15,
     lamb=0.0,
+    patience=0,
     verbose=True,
 )
 
@@ -154,15 +163,39 @@ print(f"\n[EVAL]  Test MSE: {mse:.6e}   RMSE: {mse**0.5:.6e}")
 # 6. Time rollout using learned model
 # ---------------------------------------------------------------------------
 
-def rollout_burgers(model_fn, u0: np.ndarray, n_steps: int, dt: float) -> np.ndarray:
-    """Euler rollout using the KANDy model (Euler for simplicity here)."""
-    u    = u0.copy()
-    traj = [u.copy()]
+def kandy_rhs(u):
+    """Compute u_t = KANDy(phi(u)) for a single spatial field u (1, N_x)."""
+    u_1d = u.ravel()
+    theta = build_burgers_library(u_1d[None, :])  # (N_x, 3)
+    return model.predict(theta).ravel().reshape(u.shape)
+
+
+def ssp_rk3_step(u, h, rhs_fn):
+    """SSP-RK3 (Shu-Osher) time step."""
+    k1 = rhs_fn(u)
+    u1 = u + h * k1
+    k2 = rhs_fn(u1)
+    u2 = 0.75 * u + 0.25 * (u1 + h * k2)
+    k3 = rhs_fn(u2)
+    return (1.0 / 3.0) * u + (2.0 / 3.0) * (u2 + h * k3)
+
+
+def rollout_burgers(model_fn, u0: np.ndarray, n_steps: int, dt: float,
+                    cfl: float = 0.35) -> np.ndarray:
+    """SSP-RK3 rollout with CFL-adaptive substeps (same as baselines)."""
+    u = u0[np.newaxis, :].copy()
+    traj = [u0.copy()]
     for _ in range(n_steps - 1):
-        theta = build_burgers_library(u[None, :])  # (N_x, 3)
-        u_t   = model.predict(theta).ravel()        # (N_x,)
-        u     = u + dt * u_t
-        traj.append(u.copy())
+        umax = np.max(np.abs(u)) + 1e-12
+        h_hyp = cfl * dx / umax
+        n_sub = max(1, int(np.ceil(dt / h_hyp)))
+        h = dt / n_sub
+        for _ in range(n_sub):
+            u = ssp_rk3_step(u, h, kandy_rhs)
+            if np.any(np.isnan(u)):
+                traj.append(np.full_like(u0, np.nan))
+                return np.array(traj)
+        traj.append(u.ravel().copy())
     return np.array(traj)
 
 
@@ -181,7 +214,8 @@ print(f"[EVAL]  Rollout RMSE (T={n_roll} steps): {rmse_roll:.6f}")
 # 7. Figures
 # ---------------------------------------------------------------------------
 use_pub_style()
-os.makedirs("results/Burgers", exist_ok=True)
+RESULTS = "results/Burgers"
+os.makedirs(RESULTS, exist_ok=True)
 
 # 7a. Space-time comparison
 fig, axes = plt.subplots(1, 2, figsize=(10, 4))
@@ -197,8 +231,8 @@ for ax, data, title in zip(axes,
 fig.colorbar(im, ax=axes, label="u(x,t)")
 fig.suptitle("Inviscid Burgers", fontsize=12)
 fig.tight_layout()
-fig.savefig("results/Burgers/spacetime.png", dpi=300, bbox_inches="tight")
-fig.savefig("results/Burgers/spacetime.pdf", dpi=300, bbox_inches="tight")
+fig.savefig(f"{RESULTS}/spacetime.png", dpi=300, bbox_inches="tight")
+fig.savefig(f"{RESULTS}/spacetime.pdf", dpi=300, bbox_inches="tight")
 plt.close(fig)
 
 # 7b. Edge activations with sech² fit on u-edge and linear fit on d(u²/2)/dx
@@ -208,26 +242,24 @@ train_t   = torch.tensor(Theta[sub_idx], dtype=torch.float32)
 
 # Edge (layer 0, input 2 [d(u²/2)/dx], output 0 [u_t]) — should be linear
 x_edge, y_edge = get_edge_activation(model.model_, l=0, i=2, j=0, X=train_t)
-lin_fit = fit_linear(x_edge, y_edge)
-sech_fit = fit_sech2(x_edge, y_edge)
 fig, ax = plot_edge(
     x_edge, y_edge,
-    fits=[lin_fit, sech_fit],
+    fits=["linear", "sech2"],
     title="Burgers: edge (d(u²/2)/dx → u_t)",
     xlabel="d(u²/2)/dx",
     ylabel="u_t contribution",
-    save="results/Burgers/edge_flux",
+    save=f"{RESULTS}/edge_flux",
 )
 plt.close(fig)
 
 # 7c. All edges
-fig = plot_all_edges(
+fig, axes = plot_all_edges(
     model.model_,
     X=train_t,
-    input_names=FEATURE_NAMES,
-    output_names=["u_t"],
-    title="Burgers KAN edge activations",
-    save="results/Burgers/edge_activations",
+    fits=["linear"],
+    in_var_names=FEATURE_NAMES,
+    out_var_names=["u_t"],
+    save=f"{RESULTS}/edge_activations",
 )
 plt.close(fig)
 
@@ -235,9 +267,8 @@ plt.close(fig)
 if hasattr(model, "train_results_") and model.train_results_:
     fig, ax = plot_loss_curves(
         model.train_results_,
-        title="Burgers training loss",
-        save="results/Burgers/loss_curves",
+        save=f"{RESULTS}/loss_curves",
     )
     plt.close(fig)
 
-print("[FIGS]  Saved results/Burgers/")
+print(f"[FIGS]  Saved {RESULTS}/")

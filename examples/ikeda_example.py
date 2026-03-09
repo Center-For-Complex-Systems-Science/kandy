@@ -58,7 +58,7 @@ SEED = 42
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cpu")   # PyKAN has CUDA grid-update bugs; force CPU
 
 U        = 0.9     # dissipation parameter (chaos at u ≥ 0.83)
 N_TOTAL  = 12_000
@@ -205,16 +205,20 @@ t_window = torch.arange(window, dtype=torch.float32, device=DEVICE)   # dt=1 eac
 # ---------------------------------------------------------------------------
 # 5. KANDy model — KAN = [4, 2], base_fun = RBF
 # ---------------------------------------------------------------------------
+# Identity lift — features are already computed and normalised above.
+# The physics-informed ikeda_lift is used separately in discrete_rhs.
+identity_lift = CustomLift(fn=lambda X: X, output_dim=N_FEATURES, name="ikeda_identity")
+
 model = KANDy(
-    lift=ikeda_lift,
+    lift=identity_lift,
     grid=5,
     k=3,
-    steps=100,          # initial fit; rollout training follows
+    steps=200,
     seed=SEED,
     base_fun=lambda x: torch.exp(-(x ** 2)),   # RBF base
 )
 
-# Phase 1: one-step derivative supervision only (warm start)
+# Phase 1: one-step supervision (warm start)
 print("\n--- Phase 1: warm start (one-step supervision) ---")
 model.fit(
     X=Theta_train_n,
@@ -223,7 +227,7 @@ model.fit(
     test_frac=float(n_test) / N,
     lamb=0.0,
     opt="LBFGS",
-    fit_steps=50,
+    fit_steps=200,
 )
 
 # Phase 2: fine-tune with rollout loss using the discrete_rhs trick
@@ -247,9 +251,9 @@ rollout_results = fit_kan(
     dataset_roll,
     opt="LBFGS",
     steps=100,
-    lr=1e-4,
-    batch=2048,
-    rollout_weight=0.6,
+    lr=1e-2,
+    batch=-1,                    # full batch for LBFGS
+    rollout_weight=0.2,          # gentle rollout correction
     rollout_horizon=HORIZON,
     traj_batch=512,
     dynamics_fn=discrete_rhs,
@@ -292,7 +296,13 @@ feature_syms_ikeda = [
     u_sym * x_sym * st_sym,
     u_sym * y_sym * st_sym,
 ]
-sub_map_ikeda = {vars_[i]: feature_syms_ikeda[i] for i in range(len(vars_))}
+# KAN variables are normalised features: var_i = (phi_i - mean_i) / std_i
+# Substitute back: var_i → (phi_i - mean_i) / std_i
+sub_map_ikeda = {
+    vars_[i]: (feature_syms_ikeda[i] - sp.Float(float(feat_mean[0, i])))
+              / sp.Float(float(feat_std[0, i]))
+    for i in range(len(vars_))
+}
 
 
 def _flatten(obj):
@@ -362,7 +372,6 @@ fig, ax = plot_attractor_overlay(
     dim_x=0, dim_y=1,
     labels=["True Ikeda", "KANDy"],
     colors=["#1f77b4", "#d62728"],
-    title="Ikeda optical-cavity map",
     save="results/Ikeda/attractor",
 )
 plt.close(fig)
@@ -383,12 +392,11 @@ fig.savefig("results/Ikeda/timeseries.pdf", dpi=300, bbox_inches="tight")
 plt.close(fig)
 
 # 8c. Edge activations
-fig = plot_all_edges(
+fig, axes = plot_all_edges(
     model.model_,
     X=train_t,
-    input_names=FEATURE_NAMES,
-    output_names=["x_{n+1}", "y_{n+1}"],
-    title="Ikeda KAN edge activations",
+    in_var_names=FEATURE_NAMES,
+    out_var_names=["x_{n+1}", "y_{n+1}"],
     save="results/Ikeda/edge_activations",
 )
 plt.close(fig)
@@ -397,7 +405,6 @@ plt.close(fig)
 if rollout_results:
     fig, ax = plot_loss_curves(
         rollout_results,
-        title="Ikeda rollout training loss",
         save="results/Ikeda/loss_curves",
     )
     plt.close(fig)
