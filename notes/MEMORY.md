@@ -8,10 +8,6 @@ KANDy = Kolmogorov-Arnold Networks for Dynamics. Replaces SINDy's sparse regress
 2. `cf4c107` - Adding KANE-lifting
 3. `2528722` - Good adaptive Kuramoto Results (latest)
 
-## Key Architecture Decision: No crewAI
-- crewAI was removed (2026-03-07). Agent orchestration now handled by Claude Code.
-- `main.py` rewritten as simple CLI: `uv run kandy <system>`, `uv run kandy-baselines <name>`
-
 ## Key Directories
 - `src/kandy/` - Package: core, lifts, numerics, plotting, symbolic, training
 - `examples/` - Clean example scripts (11 systems + baselines)

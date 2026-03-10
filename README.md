@@ -561,36 +561,6 @@ rk4_integrate_numpy(f, x0, T, dt)  # post-fit numpy rollout for figures
 
 ---
 
-## Research Automation Crew
-
-`src/kandy/` also contains a [crewAI](https://crewai.com) multi-agent system that
-automates four research tasks using a hierarchical process:
-
-| Task | Agent | Output |
-|---|---|---|
-| Audit experiments for algorithm correctness | PhD Student | `outputs/audit_report.md` |
-| Write a KANDy experiment for `{system}` | PhD Student | `outputs/experiment_{system}.py` |
-| Design and implement the `kandy` package | Professional Coder | `outputs/package_design.md` |
-| Write a formal peer review of results | Journal Reviewer | `outputs/review.md` |
-
-The **PhD Advisor** (manager agent) enforces that the KAN is always single-layer, all
-cross-terms live in φ, and symbolic extraction is always performed.
-
-Set your API key in `.env`:
-
-```
-MODEL=anthropic/claude-sonnet-4-6
-ANTHROPIC_API_KEY=sk-ant-...
-```
-
-Run the crew:
-
-```bash
-crewai run
-```
-
----
-
 ## References
 
 [1] Liu et al., "KAN: Kolmogorov-Arnold Networks," arXiv:2404.19756, 2024.
