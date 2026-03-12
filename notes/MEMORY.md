@@ -82,6 +82,17 @@ Coefficient bias is intrinsic to TVD limiters near shocks. Not fixable without f
 - Also switched from FD to spectral derivatives (exact on periodic domains)
 - **Lesson:** Lift should include cross-terms (u*u_x) but NOT powers of existing features (u_xx²)
 
+## Adaptive Kuramoto-Sakaguchi Results (2026-03-10)
+**Details:** See [adaptive_kuramoto.md](adaptive_kuramoto.md)
+
+- N=5 oscillators with adaptive coupling weights κ_ij
+- True: dθ_i/dt = ω_i + Σ_j κ_ij·sin(θ_i-θ_j-α), dκ_ij/dt = -ε·[κ_ij + sin(θ_i-θ_j-β)]
+- **Rollout RMSE:** θ=0.035, κ=0.008, order param=0.0003 — **excellent**
+- **Symbolic extraction:** Failed — equations have 30-50 terms each with small spurious coefficients
+- Root cause: Same library degeneracy as KS but worse. Lift has sin/cos(θ_i-θ_j) AND κ_ij (correlated features), KAN distributes signal across many edges
+- Two-model approach: theta KAN [10,5] + kappa KAN [60,20], both with base_fun=sin
+- **Bug fix:** KANDy constructor sets device=CUDA by default; must pass `device="cpu"` when model_ is assigned manually (not via fit())
+
 ## Code Changes Applied
 - `core.py`: Added `patience` param, force CPU device
 - `numerics.py`: Added `spectral_derivative()` (useful for smooth PDEs like KS)
@@ -91,6 +102,7 @@ Coefficient bias is intrinsic to TVD limiters near shocks. Not fixable without f
 - Both Burgers examples: SSP-RK3 + CFL substeps (matches paper's method)
 - `ikeda_example.py`: Identity lift fix, CPU device, corrected plotting API calls
 - `kuramoto_sivashinsky_example.py`: ETDRK4 solver, spectral derivatives, reduced 6-feature lib, IMEX rollout, OOM fix (subset for auto_symbolic), subsampling, patience=0, steps=100
+- `adaptive_kuramoto_example.py`: Fixed DEVICE=cpu, added device="cpu" to KANDy constructor
 
 ## Plotting Module (`kandy.plotting`)
 Key functions: `plot_all_edges`, `plot_edge`, `plot_loss_curves`, `plot_attractor_overlay`, `use_pub_style`
