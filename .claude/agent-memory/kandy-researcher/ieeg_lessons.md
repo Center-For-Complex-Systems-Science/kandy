@@ -107,14 +107,55 @@ Phase 2 rollout fine-tuning with Adam optimizer destroys spline shapes because:
 - KANDy can exceed OLS R^2 on noisy data by capturing nonlinear spline structure
 - sin/cos features show near-linear splines (R^2_lin > 0.9) confirming linear forcing model
 
-## Experiment v6: Mode 0 Focused Duffing-ReLU with Hyperparameter Sweep (2026-03-12) -- CURRENT BEST KAN
+## Experiment v7: Approximate Vanishing Ideal Spline Fitting (2026-03-12) -- LATEST
+
+### What's New
+- **Approximate vanishing ideal method** for symbolic spline extraction (replaces failed auto_symbolic)
+- Backward elimination pruning: drop terms if R^2 loss < 5%, much better than importance threshold
+- Separate fit strategies per edge type: poly for top row, Fourier/lin+osc for bottom row
+- Truncation of first ~12% for x^2, x^3 edges (boundary effects)
+- ReLU edge: special cubic polynomial fit captures non-monotonic response
+- Full coefficient extraction composing spline fits with normalization back to original space
+
+### Spline Fit Results (grid=3, lamb=0.001, 7/8 active)
+| Edge | Fit Type | R^2 | Equation (normalized) |
+|------|----------|-----|----------------------|
+| x | poly4 | 0.946 | 1.00 - 0.18t - 0.38t^2 + 0.21t^3 - 0.03t^4 |
+| y | poly4 (cubic) | 0.996 | 2.09 - 0.05t - 0.04t^2 + 0.02t^3 |
+| x^2 | poly2 | 0.764 | 0.40 - 0.25t + 0.04t^2 |
+| x^3 | poly2 | 0.874 | -8.50 - 1.07t + 0.16t^2 |
+| x*y | poly_trig | 0.961 | 6.24 - 0.58cos(t) |
+| ReLU | relu_poly | 0.870 | -1.05 + 0.46t^2 - 0.09t^3 |
+| sin(wt) | lin_osc | 0.994 | 0.13 + 0.08t + 0.06cos(2.25t) |
+| cos(wt) | zeroed | 0.000 | 0 |
+
+### Composed Equation (original space)
+x_ddot = +0.062 +0.024x +0.040y -0.001x^2 -0.001x^3 +0.029xy +0.020ReLU(x-theta) +0.216sin(wt)
+
+### Key Findings
+1. **Backward elimination >> importance-based pruning**: Old threshold method killed all non-constant
+   terms for edges with large constant offset (y edge was R^2=0 with old method, R^2=0.996 with new)
+2. **Run-to-run variability**: grid=3, lamb=0.001 got 6-8 active edges across runs (stochastic).
+   Retrain fallback with different seed + patience=0 helps (6->7 active this run)
+3. **Spline fits capture nonlinear structure auto_symbolic cannot**: poly+trig mixed bases work well
+4. **ReLU edge shows clear non-monotonic response**: cubic in ReLU(x-theta), confirming
+   threshold-activated nonlinear dynamics (not simple scaling)
+5. **sin(omega*t) is the dominant forcing term**: coeff=0.216, largest by far
+6. **cos(omega*t) consistently zeroed** across runs (phase absorbed into sin term)
+
+### Plots Generated
+All in results/iEEG/: spline_fits, limit_cycle, rollout, data_overview, edge_activations_detail,
+relu_response, coefficient_summary, hyperparameter_sweep + edge_activations, loss_curves, onestep,
+derivative_quality, phase_portrait, relu_activation, svd_spectrum (15 plots total, PNG+PDF)
+
+## Experiment v6: Mode 0 Focused Duffing-ReLU with Hyperparameter Sweep (2026-03-12)
 
 ### Key Results
 - Mode 0 only, hyperparameter sweep over grid={3,5,7} x lamb={0,1e-4,1e-3,5e-3,1e-2}
-- **grid=3, lamb=0.001: ALL 8/8 edges active, R^2=0.126, NRMSE=1.04**
+- **grid=3, lamb=0.001: 6-8/8 edges active (run dependent), R^2=0.06-0.13, NRMSE~1.0**
 - grid=7, lamb=0.0: highest R^2=0.137 but only 4/8 edges active
-- KANDy rollout beats OLS 2.1x (NRMSE 1.04 vs 2.19)
-- KANDy R^2=0.126 exceeds OLS R^2=0.115 (captures nonlinear structure)
+- KANDy rollout beats OLS 2.1x (NRMSE ~1.05 vs 2.19)
+- KANDy R^2 ~ 0.13 exceeds OLS R^2=0.115 (captures nonlinear structure)
 - auto_symbolic fails: R^2 too low for symbolic function matching on individual splines
 - sin/cos edges are nearly linear (R^2_lin=0.90, 0.70), confirming linear forcing
 - x^3, ReLU, x*y edges show clear nonlinear spline shapes
@@ -127,9 +168,10 @@ Phase 2 rollout fine-tuning with Adam optimizer destroys spline shapes because:
 4. **Select by structural criteria** (most active edges) not just R^2 for equation discovery
 5. **auto_symbolic fundamentally fails at R^2 ~ 0.1**: individual spline shapes don't match
    any standard basis function above R^2=0.8 threshold. Need constrained symbolic fitting.
+6. **Significant run-to-run variability**: same config produces 6-8 active edges across seeds
 
 ### Configuration
-- KAN [8, 1], grid=3, k=3, lamb=0.001, steps=500, patience=50
+- KAN [8, 1], grid=3, k=3, lamb=0.001, steps=500, patience=50 (or patience=0 for retrain)
 - Mode 0 only: 1422 samples (3 episodes x 474)
 - Same lift as v5
 

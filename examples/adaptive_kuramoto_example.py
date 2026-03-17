@@ -76,7 +76,7 @@ N_OD     = len(OD_PAIRS)   # N*(N-1) = 20
 N_FEAT   = 3 * N_OD        # sin + cos + κ = 60
 N_STATE  = N + N_OD        # 5 + 20 = 25  (raw state for rollout)
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cpu")  # PyKAN has CUDA tensor issues
 
 print(f"[PARAMS] N={N}, N_OD={N_OD}, N_FEAT={N_FEAT}, N_STATE={N_STATE}")
 print(f"         KAN_theta: [{N_FEAT}, {N}]")
@@ -327,6 +327,7 @@ model_theta = KANDy(
     steps=200,
     seed=SEED,
     base_fun=torch.sin,
+    device="cpu",
 )
 model_theta.model_          = theta_kan
 model_theta.lift_dim_       = N_FEAT
@@ -413,7 +414,7 @@ print(f"[EVAL]  Order parameter RMSE r: {rmse_r:.6f}")
 # 7. Figures
 # ---------------------------------------------------------------------------
 use_pub_style()
-os.makedirs("results/Kuramoto", exist_ok=True)
+os.makedirs("results/Adaptive-Kuramoto", exist_ok=True)
 
 t_roll = np.arange(T_EVAL) * DT_SIM
 
@@ -429,8 +430,8 @@ for i, ax in enumerate(axes):
 axes[-1].set_xlabel("time")
 fig.suptitle("Adaptive Kuramoto: phase trajectories", fontsize=11)
 fig.tight_layout()
-fig.savefig("results/Kuramoto/phase_trajectories.png", dpi=300, bbox_inches="tight")
-fig.savefig("results/Kuramoto/phase_trajectories.pdf", dpi=300, bbox_inches="tight")
+fig.savefig("results/Adaptive-Kuramoto/phase_trajectories.png", dpi=300, bbox_inches="tight")
+fig.savefig("results/Adaptive-Kuramoto/phase_trajectories.pdf", dpi=300, bbox_inches="tight")
 plt.close(fig)
 
 # 7b. Coupling weight trajectories (first 4 pairs)
@@ -446,8 +447,8 @@ for k_idx, ax in enumerate(axes):
 axes[-1].set_xlabel("time")
 fig.suptitle("Adaptive Kuramoto: coupling weights", fontsize=11)
 fig.tight_layout()
-fig.savefig("results/Kuramoto/kappa_trajectories.png", dpi=300, bbox_inches="tight")
-fig.savefig("results/Kuramoto/kappa_trajectories.pdf", dpi=300, bbox_inches="tight")
+fig.savefig("results/Adaptive-Kuramoto/kappa_trajectories.png", dpi=300, bbox_inches="tight")
+fig.savefig("results/Adaptive-Kuramoto/kappa_trajectories.pdf", dpi=300, bbox_inches="tight")
 plt.close(fig)
 
 # 7c. Order parameter r(t)
@@ -460,19 +461,19 @@ ax.set_title(f"Kuramoto order parameter  (RMSE={rmse_r:.4f})")
 ax.legend(fontsize=8)
 ax.set_ylim(0, 1.05)
 fig.tight_layout()
-fig.savefig("results/Kuramoto/order_parameter.png", dpi=300, bbox_inches="tight")
-fig.savefig("results/Kuramoto/order_parameter.pdf", dpi=300, bbox_inches="tight")
+fig.savefig("results/Adaptive-Kuramoto/order_parameter.png", dpi=300, bbox_inches="tight")
+fig.savefig("results/Adaptive-Kuramoto/order_parameter.pdf", dpi=300, bbox_inches="tight")
 plt.close(fig)
 
 # 7d. Loss curves (theta model)
 if hasattr(model_theta, "train_results_") and model_theta.train_results_:
     fig, ax = plot_loss_curves(
         model_theta.train_results_,
-        save="results/Kuramoto/loss_phase",
+        save="results/Adaptive-Kuramoto/loss_phase",
     )
     plt.close(fig)
 
-print("[FIGS]  Saved results/Kuramoto/")
+print("[FIGS]  Saved results/Adaptive-Kuramoto/")
 
 # ---------------------------------------------------------------------------
 # 8. Symbolic extraction (after rollout — splines replaced with sym fns here)

@@ -1,4 +1,0 @@
-User name is Kevin Slote.
-User is an Applied Mathematician.
-User is interested in Data-Driven Dynamical Systems.
-User is based in Atlanta, Georgia.

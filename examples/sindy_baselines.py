@@ -8,7 +8,7 @@ Implements SINDy (Brunton et al. 2016) on the same systems used in KANDy:
 
 Requires: pip install pysindy
 
-Results are saved to outputs/baselines/ and printed as a comparison table.
+Results are saved to results/SINDy/baselines/ and printed as a comparison table.
 """
 
 import os
@@ -21,8 +21,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
-os.makedirs("outputs/baselines", exist_ok=True)
-os.makedirs("results/SINDy", exist_ok=True)
+os.makedirs("results/SINDy/baselines", exist_ok=True)
 
 try:
     import pysindy as ps
@@ -352,8 +351,8 @@ table_lines = [
 for row in results:
     table_lines.append(f"| {' | '.join(row)} |")
 
-os.makedirs("outputs/baselines", exist_ok=True)
-with open("outputs/baselines/sindy_table.md", "w") as f:
+os.makedirs("results/SINDy/baselines", exist_ok=True)
+with open("results/SINDy/baselines/sindy_table.md", "w") as f:
     f.write("\n".join(table_lines) + "\n")
 
-print("\n[DONE] SINDy baselines complete.  Results saved to outputs/baselines/sindy_table.md")
+print("\n[DONE] SINDy baselines complete.  Results saved to results/SINDy/baselines/sindy_table.md")

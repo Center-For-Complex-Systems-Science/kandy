@@ -431,3 +431,64 @@ def substitute_params(
         sub_map[sym] = sp.nsimplify(v, rational=False, tolerance=1e-4)
 
     return [sp.simplify(expr.subs(sub_map)) for expr in formulas]
+
+def robust_auto_symbolic(
+    model,
+    *,
+    lib,
+    a_range=(-10, 10),
+    b_range=(-10, 10),
+    r2_threshold=0.90,
+    weight_simple=0.90,
+    topk_edges=64,
+    max_total_complexity=None,
+    set_others_to_zero=True,
+    weight=0.05,
+):
+    candidates = []
+
+    # --- collect best symbolic candidate per edge ---
+    for l in range(len(model.width_in) - 1):
+        for i in range(int(model.width_in[l])):
+            for j in range(int(model.width_out[l + 1])):
+                name, _, r2, c = model.suggest_symbolic(
+                    l, i, j,
+                    a_range=a_range,
+                    b_range=b_range,
+                    lib=lib,
+                    verbose=False,
+                    weight_simple=weight_simple,
+                )
+
+                penalty = (weight_simple / (1e-8 + (1.0 - weight_simple + 1e-8))) * c
+                score = r2 - weight * penalty
+
+                candidates.append((l, i, j, str(name), float(r2), float(c), float(score)))
+
+    # --- filter + rank ---
+    eligible = [d for d in candidates if d[4] >= r2_threshold and d[3] != "0"]
+    eligible.sort(key=lambda d: d[6], reverse=True)
+
+    kept = []
+    if max_total_complexity is None:
+        kept = eligible[:topk_edges]
+    else:
+        total_c = 0.0
+        for d in eligible:
+            if len(kept) >= topk_edges:
+                break
+            if total_c + d[5] <= max_total_complexity:
+                kept.append(d)
+                total_c += d[5]
+
+    kept_set = {(l, i, j) for (l, i, j, *_ ) in kept}
+
+    # --- apply fixes ---
+    for l, i, j, name, *_ in candidates:
+        if (l, i, j) in kept_set:
+            model.fix_symbolic(l, i, j, name, verbose=False, log_history=False)
+        elif set_others_to_zero:
+            model.fix_symbolic(l, i, j, "0", verbose=False, log_history=False)
+
+    model.log_history("robust_auto_symbolic")
+    return model

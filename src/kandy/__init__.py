@@ -63,6 +63,7 @@ from .symbolic import (
     TRIG_LIB,
     TRIG_LIB_CHEAP,
     auto_symbolic_with_costs,
+    robust_auto_symbolic,
     score_formula,
     formulas_to_latex,
     substitute_params,

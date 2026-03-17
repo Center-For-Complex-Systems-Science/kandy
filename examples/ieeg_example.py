@@ -63,6 +63,7 @@ from kandy.plotting import (
     use_pub_style,
 )
 from kandy.symbolic import auto_symbolic_with_costs, POLY_LIB_CHEAP, POLY_LIB
+from scipy.optimize import curve_fit
 
 # ---------------------------------------------------------------------------
 # 0. Configuration
@@ -589,16 +590,74 @@ valid_by_edges = sorted(valid_results, key=lambda r: (r["n_active"], r["r2"]), r
 best_r2 = valid_by_r2[0] if valid_by_r2 else sweep_results[0]
 best_struct = valid_by_edges[0] if valid_by_edges else sweep_results[0]
 
-# Use structural model (most active edges) as primary, R^2 model as secondary
-# Rationale: with R^2 ~ 0.1, more active edges = more structural info
-model = best_struct["model"]
-best = best_struct
+# Prefer grid=3, lamb=0.001 (validated best config from prior experiments).
+# Fall back to structural (most active edges) if preferred is not available.
+PREFERRED_GRID = 3
+PREFERRED_LAMB = 0.001
+preferred = [r for r in sweep_results
+             if r["grid"] == PREFERRED_GRID and r["lamb"] == PREFERRED_LAMB]
+if preferred:
+    model = preferred[0]["model"]
+    best = preferred[0]
+    print(f"  Selected PREFERRED config: grid={PREFERRED_GRID}, lamb={PREFERRED_LAMB}, "
+          f"R^2={best['r2']:.4f}, active={best['n_active']}/{N_FEAT}")
+else:
+    model = best_struct["model"]
+    best = best_struct
+    print(f"  Preferred config not found, using structural model")
 
 print(f"  Best R^2:    grid={best_r2['grid']}, lamb={best_r2['lamb']}, "
       f"R^2={best_r2['r2']:.4f}, active={best_r2['n_active']}/{N_FEAT}")
 print(f"  Best struct: grid={best_struct['grid']}, lamb={best_struct['lamb']}, "
       f"R^2={best_struct['r2']:.4f}, active={best_struct['n_active']}/{N_FEAT}")
-print(f"  --> Using structural model (most active edges)")
+
+# If preferred config got fewer than 8 active edges, retrain with patience=0
+# (no early stopping) to give the model a chance to develop all splines.
+if best["n_active"] < N_FEAT and best["grid"] == PREFERRED_GRID and best["lamb"] == PREFERRED_LAMB:
+    print(f"\n  Preferred config has {best['n_active']}/{N_FEAT} active edges.")
+    print(f"  Re-training with patience=0 (no early stopping) ...")
+    np.random.seed(SEED + 1)  # slightly different seed
+    torch.manual_seed(SEED + 1)
+    lift_re = IdentityLiftWithNames(N_FEAT, FEATURE_NAMES)
+    model_re = KANDy(
+        lift=lift_re, grid=PREFERRED_GRID, k=K_SPLINE,
+        steps=STEPS_SWEEP, seed=SEED + 1, device="cpu",
+    )
+    model_re.fit(
+        X=features_n, X_dot=targets_2d,
+        val_frac=0.15, test_frac=0.10,
+        lamb=PREFERRED_LAMB, patience=0, verbose=False,
+    )
+    # Re-evaluate
+    pred_re = model_re.predict(features_n)
+    if pred_re.ndim == 1:
+        pred_re = pred_re[:, None]
+    pred_re_un = pred_re[:, 0] * tgt_std + tgt_mean
+    ss_r_re = np.sum((targets_all - pred_re_un) ** 2)
+    ss_t_re = np.sum((targets_all - targets_all.mean()) ** 2)
+    r2_re = 1 - ss_r_re / max(ss_t_re, 1e-12)
+    # Count active edges
+    sym_in_re = torch.tensor(features_n[:min(512, N_total)], dtype=torch.float32)
+    model_re.model_.save_act = True
+    with torch.no_grad():
+        model_re.model_(sym_in_re)
+    edge_ranges_re = []
+    for ii in range(N_FEAT):
+        x_a_re, y_a_re = get_edge_activation(model_re.model_, l=0, i=ii, j=0)
+        edge_ranges_re.append(np.max(y_a_re) - np.min(y_a_re))
+    max_range_re = max(edge_ranges_re)
+    thresh_re = 0.05 * max_range_re if max_range_re > 1e-8 else 1e-8
+    n_active_re = sum(1 for rr in edge_ranges_re if rr > thresh_re)
+    tl_re = model_re.train_results_["train_loss"][-1]
+    print(f"  Re-trained: R^2={r2_re:.4f}, active={n_active_re}/{N_FEAT}, loss={tl_re:.6f}")
+    if n_active_re >= best["n_active"]:
+        model = model_re
+        best = {"grid": PREFERRED_GRID, "lamb": PREFERRED_LAMB,
+                "r2": r2_re, "n_active": n_active_re,
+                "train_loss": tl_re, "edge_ranges": edge_ranges_re, "model": model_re}
+        print(f"  --> Using re-trained model ({n_active_re} active edges)")
+    else:
+        print(f"  --> Keeping original ({best['n_active']} active edges)")
 
 # Print sweep summary table
 print(f"\n  Full sweep results:")
@@ -897,89 +956,602 @@ print(f"  NRMSE        = {ols_nrmse:.4f}")
 print(f"  Bounded: {'YES' if np.all(np.isfinite(traj_ols)) and np.max(np.abs(traj_ols)) < 100 else 'NO'}")
 
 # ---------------------------------------------------------------------------
-# 14. Plots
+# 14. Approximate Vanishing Ideal: Symbolic spline fitting
 # ---------------------------------------------------------------------------
 print(f"\n{'='*70}")
-print(f"  STEP 13: Publication-quality plots")
+print(f"  STEP 13: Approximate vanishing ideal — symbolic spline fitting")
 print(f"{'='*70}")
 
 use_pub_style()
 
-# 14a. Data overview: Mode 0 across all episodes
-fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=False)
+
+def estimate_frequency_fft(x_data, y_data):
+    """Estimate dominant frequency from spline (input, output) data via FFT."""
+    # Resample onto uniform grid for FFT
+    n_pts = len(x_data)
+    dx = (x_data[-1] - x_data[0]) / max(n_pts - 1, 1)
+    if dx < 1e-12:
+        return 1.0
+    y_detrend = y_data - np.mean(y_data)
+    fft_vals = np.abs(np.fft.rfft(y_detrend))
+    freqs = np.fft.rfftfreq(n_pts, d=dx)
+    # Skip DC and very low freq
+    mask = freqs > 0.5 / (x_data[-1] - x_data[0])
+    if not np.any(mask):
+        return 1.0
+    peak_idx = np.argmax(fft_vals[mask])
+    peak_freq = freqs[mask][peak_idx]
+    return 2.0 * np.pi * peak_freq
+
+
+def fit_spline_symbolic(x_data, y_data, basis_funcs, basis_names, threshold=0.01):
+    """Fit spline data with candidate basis functions (approximate vanishing ideal).
+
+    Uses backward elimination: start with all terms, drop the least important
+    one at a time as long as R^2 doesn't degrade by more than 5%.
+
+    Returns kept_names, kept_coeffs, r2_full, r2_sparse, y_pred_sparse.
+    """
+    Phi = np.column_stack([f(x_data) for f in basis_funcs])
+    n_basis = Phi.shape[1]
+
+    # Full OLS fit
+    coeffs, _, _, _ = np.linalg.lstsq(Phi, y_data, rcond=None)
+    y_pred = Phi @ coeffs
+    ss_tot = np.sum((y_data - y_data.mean())**2)
+    r2_full = 1.0 - np.sum((y_data - y_pred)**2) / max(ss_tot, 1e-12)
+
+    # Backward elimination: drop terms whose removal costs < 5% relative R^2
+    active = list(range(n_basis))
+    r2_current = r2_full
+
+    while len(active) > 1:
+        worst_idx = None
+        best_r2_after_drop = -np.inf
+        for trial_drop in range(len(active)):
+            trial_active = active[:trial_drop] + active[trial_drop + 1:]
+            Phi_trial = Phi[:, trial_active]
+            c_trial, _, _, _ = np.linalg.lstsq(Phi_trial, y_data, rcond=None)
+            y_trial = Phi_trial @ c_trial
+            r2_trial = 1.0 - np.sum((y_data - y_trial)**2) / max(ss_tot, 1e-12)
+            if r2_trial > best_r2_after_drop:
+                best_r2_after_drop = r2_trial
+                worst_idx = trial_drop
+
+        # Drop if R^2 loss is < 5% of current R^2 (and contribution is below threshold)
+        r2_loss_frac = (r2_current - best_r2_after_drop) / max(abs(r2_current), 1e-12)
+        if r2_loss_frac < 0.05 and best_r2_after_drop > r2_full * 0.8:
+            active = active[:worst_idx] + active[worst_idx + 1:]
+            r2_current = best_r2_after_drop
+        else:
+            break
+
+    # Refit with final active terms
+    Phi_sparse = Phi[:, active]
+    coeffs_sparse, _, _, _ = np.linalg.lstsq(Phi_sparse, y_data, rcond=None)
+    y_pred_sparse = Phi_sparse @ coeffs_sparse
+    r2_sparse = 1.0 - np.sum((y_data - y_pred_sparse)**2) / max(ss_tot, 1e-12)
+
+    kept_names = [basis_names[i] for i in active]
+    return kept_names, coeffs_sparse, r2_full, r2_sparse, y_pred_sparse
+
+
+def fit_fourier_sincos(x_data, y_data, alpha):
+    """Fit y = a0 + a1*sin(alpha*x) + a2*cos(alpha*x) + a3*sin(2*alpha*x) + a4*cos(2*alpha*x)."""
+    basis_funcs = [
+        lambda t: np.ones_like(t),
+        lambda t, a=alpha: np.sin(a * t),
+        lambda t, a=alpha: np.cos(a * t),
+        lambda t, a=alpha: np.sin(2 * a * t),
+        lambda t, a=alpha: np.cos(2 * a * t),
+    ]
+    basis_names = ["1", f"sin({alpha:.2f}t)", f"cos({alpha:.2f}t)",
+                   f"sin({2*alpha:.2f}t)", f"cos({2*alpha:.2f}t)"]
+    return fit_spline_symbolic(x_data, y_data, basis_funcs, basis_names)
+
+
+def fit_linear_trend_sincos(x_data, y_data, alpha):
+    """Fit y = a0 + a1*t + a2*sin(alpha*t) + a3*cos(alpha*t)."""
+    basis_funcs = [
+        lambda t: np.ones_like(t),
+        lambda t: t,
+        lambda t, a=alpha: np.sin(a * t),
+        lambda t, a=alpha: np.cos(a * t),
+    ]
+    basis_names = ["1", "t", f"sin({alpha:.2f}t)", f"cos({alpha:.2f}t)"]
+    return fit_spline_symbolic(x_data, y_data, basis_funcs, basis_names)
+
+
+def fit_poly_monomial(x_data, y_data, max_degree=4):
+    """Fit y = a0 + a1*t + ... + a_d*t^d."""
+    basis_funcs = [lambda t, d=d: t**d for d in range(max_degree + 1)]
+    basis_names = ["1"] + [f"t^{d}" if d > 1 else "t" for d in range(1, max_degree + 1)]
+    return fit_spline_symbolic(x_data, y_data, basis_funcs, basis_names)
+
+
+def fit_poly_trig_mixed(x_data, y_data):
+    """Fit y = a0 + a1*t + a2*t^2 + a3*sin(t) + a4*cos(t)."""
+    basis_funcs = [
+        lambda t: np.ones_like(t),
+        lambda t: t,
+        lambda t: t**2,
+        lambda t: np.sin(t),
+        lambda t: np.cos(t),
+    ]
+    basis_names = ["1", "t", "t^2", "sin(t)", "cos(t)"]
+    return fit_spline_symbolic(x_data, y_data, basis_funcs, basis_names)
+
+
+def fit_relu_response(x_data, y_data):
+    """Fit ReLU edge: y = a0 + a1*r + a2*sin(b*r + c) via nonlinear opt."""
+    # First try polynomial
+    poly_names, poly_coeffs, poly_r2f, poly_r2s, poly_pred = fit_poly_monomial(x_data, y_data, 4)
+
+    # Also try oscillatory: a0 + a1*r + a2*sin(b*r + c)
+    alpha_est = estimate_frequency_fft(x_data, y_data)
+
+    def _osc_model(t, a0, a1, a2, b, c):
+        return a0 + a1 * t + a2 * np.sin(b * t + c)
+
+    p0 = [np.mean(y_data), 0.0, np.ptp(y_data) / 2, alpha_est, 0.0]
+    try:
+        params, _ = curve_fit(_osc_model, x_data, y_data, p0=p0, maxfev=20000)
+        y_osc = _osc_model(x_data, *params)
+        ss_tot = np.sum((y_data - y_data.mean())**2)
+        osc_r2 = 1.0 - np.sum((y_data - y_osc)**2) / max(ss_tot, 1e-12)
+    except RuntimeError:
+        osc_r2 = -1.0
+        params = p0
+        y_osc = _osc_model(x_data, *params)
+
+    if osc_r2 > poly_r2s:
+        a0, a1, a2, b, c = params
+        terms = [f"{a0:.4f}"]
+        if abs(a1) > 1e-4:
+            terms.append(f"{a1:+.4f}*r")
+        terms.append(f"{a2:+.4f}*sin({b:.2f}*r{c:+.2f})")
+        name_str = " ".join(terms)
+        return (name_str, params, osc_r2, y_osc, "oscillatory")
+    else:
+        return (poly_names, poly_coeffs, poly_r2s, poly_pred, "polynomial")
+
+
+# Extract spline data for all 8 edges
+print("\n  Extracting spline activations for all 8 edges ...")
+N_SYM_PTS = min(1024, N_total)
+sym_input_full = torch.tensor(features_n[:N_SYM_PTS], dtype=torch.float32)
+model.model_.save_act = True
+with torch.no_grad():
+    model.model_(sym_input_full)
+
+spline_data = {}
+for i in range(N_FEAT):
+    x_a, y_a = get_edge_activation(model.model_, l=0, i=i, j=0)
+    spline_data[i] = (x_a, y_a)
+    print(f"    Edge {i} ({FEATURE_NAMES[i]}): {len(x_a)} pts, "
+          f"range=[{x_a.min():.3f}, {x_a.max():.3f}] -> "
+          f"[{y_a.min():.6f}, {y_a.max():.6f}]")
+
+# Fit each edge
+TRUNCATE_FRAC = 0.12  # Remove first 12% for edges with boundary effects
+
+spline_fits = {}
+
+for i in range(N_FEAT):
+    x_a, y_a = spline_data[i]
+    fname = FEATURE_NAMES[i]
+    rng = np.max(y_a) - np.min(y_a)
+    is_active = rng > threshold
+
+    print(f"\n  --- Edge {i}: {fname} (range={rng:.6f}, "
+          f"{'ACTIVE' if is_active else 'zeroed'}) ---")
+
+    if not is_active:
+        spline_fits[i] = {
+            "name": fname, "fit_type": "zeroed", "r2": 0.0,
+            "equation": "0", "y_pred": np.zeros_like(y_a),
+            "x_data": x_a, "y_data": y_a, "truncated": False,
+            "trunc_idx": 0, "terms": [], "coeffs": [],
+        }
+        print(f"    -> zeroed (range below threshold)")
+        continue
+
+    # Decide fit strategy based on edge index
+    truncated = False
+    trunc_idx = 0
+    x_fit, y_fit = x_a, y_a
+
+    if i in [2, 3]:  # x^2, x^3 edges -- truncate boundary effects
+        n_trunc = int(TRUNCATE_FRAC * len(x_a))
+        if n_trunc > 5:
+            x_fit = x_a[n_trunc:]
+            y_fit = y_a[n_trunc:]
+            truncated = True
+            trunc_idx = n_trunc
+            print(f"    Truncated first {n_trunc} points ({TRUNCATE_FRAC*100:.0f}%) "
+                  f"for boundary effect removal")
+
+    best_fit = None
+    best_r2 = -999.0
+    best_type = "none"
+
+    if i <= 4:
+        # Top row: polynomial and mixed poly-trig fits
+        # Polynomial up to degree 4
+        pn, pc, prf, prs, ppred = fit_poly_monomial(x_fit, y_fit, 4)
+        if prs > best_r2:
+            best_r2 = prs
+            best_fit = (pn, pc, prs, ppred)
+            best_type = "poly4"
+        print(f"    poly(deg 4): R^2={prs:.4f}, terms={pn}, coeffs={[f'{c:.4f}' for c in pc]}")
+
+        # Polynomial degree 2
+        pn2, pc2, prf2, prs2, ppred2 = fit_poly_monomial(x_fit, y_fit, 2)
+        # Prefer lower degree if R^2 is close
+        if prs2 > 0.9 * prs and len(pn2) <= len(pn):
+            if prs2 > best_r2 * 0.95:
+                best_r2 = prs2
+                best_fit = (pn2, pc2, prs2, ppred2)
+                best_type = "poly2"
+        print(f"    poly(deg 2): R^2={prs2:.4f}, terms={pn2}")
+
+        # Mixed poly-trig
+        pnm, pcm, prfm, prsm, ppredm = fit_poly_trig_mixed(x_fit, y_fit)
+        if prsm > best_r2:
+            best_r2 = prsm
+            best_fit = (pnm, pcm, prsm, ppredm)
+            best_type = "poly_trig"
+        print(f"    poly+trig:   R^2={prsm:.4f}, terms={pnm}")
+
+    elif i == 5:
+        # ReLU edge -- special handling
+        result = fit_relu_response(x_fit, y_fit)
+        if result[4] == "oscillatory":
+            best_fit = (result[0], result[1], result[2], result[3])
+            best_r2 = result[2]
+            best_type = "relu_osc"
+            print(f"    relu(osc):   R^2={result[2]:.4f}, eq={result[0]}")
+        else:
+            best_fit = (result[0], result[1], result[2], result[3])
+            best_r2 = result[2]
+            best_type = "relu_poly"
+            print(f"    relu(poly):  R^2={result[2]:.4f}, terms={result[0]}")
+
+        # Also try polynomial for comparison
+        pn, pc, prf, prs, ppred = fit_poly_monomial(x_fit, y_fit, 4)
+        print(f"    poly(deg 4): R^2={prs:.4f}")
+        if prs > best_r2:
+            best_r2 = prs
+            best_fit = (pn, pc, prs, ppred)
+            best_type = "relu_poly_alt"
+
+    else:
+        # Bottom row (sin/cos edges) -- Fourier fits
+        alpha_est = estimate_frequency_fft(x_fit, y_fit)
+        print(f"    Estimated freq: alpha={alpha_est:.4f}")
+
+        # Fourier basis
+        fn, fc, frf, frs, fpred = fit_fourier_sincos(x_fit, y_fit, alpha_est)
+        if frs > best_r2:
+            best_r2 = frs
+            best_fit = (fn, fc, frs, fpred)
+            best_type = "fourier"
+        print(f"    fourier:     R^2={frs:.4f}, terms={fn}")
+
+        # Linear trend + osc
+        ln, lc, lrf, lrs, lpred = fit_linear_trend_sincos(x_fit, y_fit, alpha_est)
+        if lrs > best_r2:
+            best_r2 = lrs
+            best_fit = (ln, lc, lrs, lpred)
+            best_type = "lin_osc"
+        print(f"    lin+osc:     R^2={lrs:.4f}, terms={ln}")
+
+        # Polynomial fallback
+        pn, pc, prf, prs, ppred = fit_poly_monomial(x_fit, y_fit, 3)
+        if prs > best_r2:
+            best_r2 = prs
+            best_fit = (pn, pc, prs, ppred)
+            best_type = "poly3"
+        print(f"    poly(deg 3): R^2={prs:.4f}")
+
+    terms, coeffs_fit, r2_chosen, y_pred_fit = best_fit
+    # Build equation string
+    if isinstance(terms, str):
+        eq_str = terms
+    else:
+        eq_parts = []
+        for tn, tc in zip(terms, coeffs_fit):
+            if tn == "1":
+                eq_parts.append(f"{tc:.4f}")
+            elif tn.startswith("t^"):
+                eq_parts.append(f"{tc:+.4f}*{tn}")
+            elif tn == "t":
+                eq_parts.append(f"{tc:+.4f}*t")
+            else:
+                eq_parts.append(f"{tc:+.4f}*{tn}")
+        eq_str = " ".join(eq_parts)
+
+    print(f"    BEST ({best_type}): R^2={r2_chosen:.4f}")
+    print(f"    psi_{i}(t) = {eq_str}")
+
+    spline_fits[i] = {
+        "name": fname, "fit_type": best_type, "r2": r2_chosen,
+        "equation": eq_str, "y_pred": y_pred_fit,
+        "x_data": x_a, "y_data": y_a,
+        "x_fit": x_fit, "y_fit": y_fit,
+        "truncated": truncated, "trunc_idx": trunc_idx,
+        "terms": terms if isinstance(terms, list) else [terms],
+        "coeffs": coeffs_fit if isinstance(coeffs_fit, np.ndarray) else np.array([]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 15. Extract final composed coefficients: x_ddot = sum_i A_i * psi_i(feature_i)
+# ---------------------------------------------------------------------------
+print(f"\n{'='*70}")
+print(f"  STEP 14: Extract final composed equation")
+print(f"{'='*70}")
+
+# The KANDy model operates in normalized space:
+#   targets_n = (targets_all - tgt_mean) / tgt_std
+#   features_n = (features_all - feat_mean) / feat_std
+# The KAN learns: targets_n_pred = sum_i psi_i(features_n_i)
+# where psi_i is the full spline including the output linear weight.
+# Composing back to original space:
+#   x_ddot = tgt_std * [sum_i psi_i((feat_i - feat_mean_i)/feat_std_i)] + tgt_mean
+#
+# For each active edge, the spline psi_i maps normalized input to a contribution
+# to normalized output. The final equation is:
+#   x_ddot = tgt_mean + tgt_std * sum_i psi_i(feat_i_normalized)
+#
+# Since the spline fits give us psi_i(t) in normalized coords, we compose:
+#   psi_i(t_normalized) where t_normalized = (feat_i - feat_mean_i) / feat_std_i
+#
+# For a linear spline psi_i(t) = slope*t + intercept:
+#   contribution to x_ddot = tgt_std * [slope * (feat_i - mu_i)/sigma_i + intercept]
+#                           = (tgt_std * slope / sigma_i) * feat_i
+#                             + tgt_std * (intercept - slope * mu_i / sigma_i)
+
+print("\n  Composing equation in original (un-normalized) space:")
+print(f"  (tgt_mean={tgt_mean:.6f}, tgt_std={tgt_std:.6f})")
+
+constant_total = tgt_mean
+composed_coeffs = {}
+
+for i in range(N_FEAT):
+    fname = FEATURE_NAMES[i]
+    fit = spline_fits[i]
+    rng = np.max(fit["y_data"]) - np.min(fit["y_data"])
+
+    if rng <= threshold:
+        print(f"    Edge {i} ({fname}): ZEROED")
+        continue
+
+    # For the composed equation, we extract the effective linear coefficient
+    # from the spline in normalized space, then convert to original space.
+    # Get the linear approximation slope from the full spline data
+    x_a, y_a = fit["x_data"], fit["y_data"]
+    if np.std(x_a) > 1e-10:
+        p = np.polyfit(x_a, y_a, 1)
+        slope_norm = p[0]
+        intercept_norm = p[1]
+    else:
+        slope_norm = 0.0
+        intercept_norm = np.mean(y_a)
+
+    # Convert linear approximation to original space
+    coeff_orig = tgt_std * slope_norm / feat_std[i]
+    constant_total += tgt_std * (intercept_norm - slope_norm * feat_mean[i] / feat_std[i])
+
+    composed_coeffs[fname] = {
+        "linear_coeff": coeff_orig,
+        "slope_norm": slope_norm,
+        "intercept_norm": intercept_norm,
+        "fit_type": fit["fit_type"],
+        "fit_r2": fit["r2"],
+        "fit_eq": fit["equation"],
+    }
+
+    print(f"    Edge {i} ({fname}): slope_norm={slope_norm:.6f}, "
+          f"coeff_orig={coeff_orig:+.6f}, fit_type={fit['fit_type']}, "
+          f"fit_R^2={fit['r2']:.4f}")
+
+# Build final equation string
+eq_terms = []
+if abs(constant_total) > 1e-6:
+    eq_terms.append(f"{constant_total:+.6f}")
+for fname, info in composed_coeffs.items():
+    if abs(info["linear_coeff"]) > 1e-6:
+        eq_terms.append(f"{info['linear_coeff']:+.6f}*{fname}")
+
+full_eq = " ".join(eq_terms) if eq_terms else "0"
+print(f"\n  Full discovered equation (linear approx of splines):")
+print(f"  x_ddot = {full_eq}")
+print(f"\n  Individual spline equations (normalized space):")
+for i in range(N_FEAT):
+    fit = spline_fits[i]
+    print(f"    psi_{i}({FEATURE_NAMES[i]}) = {fit['equation']}  "
+          f"[R^2={fit['r2']:.4f}, type={fit['fit_type']}]")
+
+
+# ---------------------------------------------------------------------------
+# 16. Publication-quality plots
+# ---------------------------------------------------------------------------
+print(f"\n{'='*70}")
+print(f"  STEP 15: Publication-quality plots")
+print(f"{'='*70}")
+
+
+# ------- Plot 1: spline_fits.png — 2x4 grid with symbolic fit overlays -------
+fig_sf, axes_sf = plt.subplots(2, 4, figsize=(16, 8))
+for i, ax in enumerate(axes_sf.flat):
+    if i >= N_FEAT:
+        ax.set_visible(False)
+        continue
+
+    fit = spline_fits[i]
+    x_a, y_a = fit["x_data"], fit["y_data"]
+
+    # Sort for clean plotting
+    order = np.argsort(x_a)
+    x_sorted = x_a[order]
+    y_sorted = y_a[order]
+
+    ax.plot(x_sorted, y_sorted, color="#1f77b4", lw=1.8, alpha=0.85, label="Learned spline")
+
+    # Overlay symbolic fit
+    if fit["fit_type"] != "zeroed" and len(fit["y_pred"]) > 0:
+        if fit["truncated"]:
+            n_trunc = fit["trunc_idx"]
+            x_fit_sorted = x_sorted[n_trunc:]
+            y_pred_sorted = fit["y_pred"][np.argsort(fit["x_fit"])]
+            ax.plot(x_fit_sorted, y_pred_sorted, color="#d62728",
+                    lw=1.5, ls="--", alpha=0.9, label="Symbolic fit")
+            # Show truncation boundary
+            ax.axvline(x_sorted[n_trunc], color="#ff7f0e", ls=":", lw=1.0,
+                       alpha=0.7, label="Truncation")
+        else:
+            y_pred_sorted = fit["y_pred"][np.argsort(fit["x_fit"] if "x_fit" in fit else x_a)]
+            ax.plot(x_sorted, y_pred_sorted, color="#d62728",
+                    lw=1.5, ls="--", alpha=0.9, label="Symbolic fit")
+
+    # Title with equation and R^2
+    rng = np.max(y_a) - np.min(y_a)
+    status = "ACTIVE" if rng > threshold else "zeroed"
+    r2_str = f"R^2={fit['r2']:.3f}" if fit["fit_type"] != "zeroed" else "zeroed"
+    ax.set_title(f"{FEATURE_NAMES[i]}  ({status})\n{r2_str}", fontsize=9)
+    ax.set_xlabel(f"Normalized {FEATURE_NAMES[i]}", fontsize=8)
+    ax.set_ylabel(r"$\psi_i$", fontsize=8)
+    ax.tick_params(labelsize=7)
+    ax.grid(True, alpha=0.2, linewidth=0.4)
+    if fit["fit_type"] != "zeroed":
+        ax.legend(fontsize=6.5, loc="best", framealpha=0.8)
+
+fig_sf.suptitle(
+    f"Spline activations with symbolic fits  "
+    f"(grid={best['grid']}, lamb={best['lamb']})",
+    fontsize=12,
+)
+fig_sf.tight_layout()
+fig_sf.savefig(f"{OUT_DIR}/spline_fits.png", dpi=300, bbox_inches="tight")
+fig_sf.savefig(f"{OUT_DIR}/spline_fits.pdf", dpi=300, bbox_inches="tight")
+plt.close(fig_sf)
+print(f"[PLOT] Saved {OUT_DIR}/spline_fits.png/pdf")
+
+
+# ------- Plot 2: limit_cycle.png — KANDy limit cycle in (x, x_dot) plane -------
+fig_lc, ax_lc = plt.subplots(figsize=(5.5, 5.0))
+
+# True trajectory in background
+ax_lc.plot(traj_true[:, 0], traj_true[:, 1],
+           color="#B8B8B8", lw=0.8, alpha=0.5, zorder=1,
+           label="True trajectory", rasterized=True)
+
+# KANDy rollout -- thick, prominent
+ax_lc.plot(traj_pred[:, 0], traj_pred[:, 1],
+           color="#1f77b4", lw=2.0, alpha=0.92, zorder=3,
+           solid_capstyle="round", label="KANDy rollout")
+
+# Theta threshold line
+ax_lc.axvline(THETA_EST, color="#ff7f0e", ls="--", lw=1.2, alpha=0.7,
+              zorder=2, label=rf"$\theta$={THETA_EST:.2f}")
+
+# Initial condition marker
+ax_lc.scatter([traj_true[0, 0]], [traj_true[0, 1]],
+              s=80, c="#2ca02c", marker="o", zorder=5,
+              edgecolors="white", linewidths=0.8, label="Initial condition")
+
+ax_lc.set_xlabel(r"$x$ (SVD mode 0)", fontsize=11)
+ax_lc.set_ylabel(r"$\dot{x}$", fontsize=11)
+
+ax_lc.spines["top"].set_visible(False)
+ax_lc.spines["right"].set_visible(False)
+ax_lc.legend(fontsize=9, frameon=True, framealpha=0.92, edgecolor="#888888",
+             fancybox=False, borderpad=0.4, loc="upper left")
+ax_lc.grid(True, alpha=0.15, linewidth=0.4)
+
+fig_lc.tight_layout(pad=0.5)
+fig_lc.savefig(f"{OUT_DIR}/limit_cycle.png", dpi=300, bbox_inches="tight")
+fig_lc.savefig(f"{OUT_DIR}/limit_cycle.pdf", dpi=300, bbox_inches="tight")
+plt.close(fig_lc)
+print(f"[PLOT] Saved {OUT_DIR}/limit_cycle.png/pdf")
+
+
+# ------- Plot 3: rollout.png — Updated rollout (x and y vs time) -------
+fig_ro, axes_ro = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+# x trajectory
+axes_ro[0].plot(t_roll_ep1[:N_ROLL], traj_true[:, 0], "k-", lw=1.5, label="True", alpha=0.8)
+axes_ro[0].plot(t_roll_ep1[:N_ROLL], traj_pred[:, 0], "#1f77b4", lw=1.2,
+                ls="--", label=f"KANDy (RMSE={rollout_rmse_x:.3f})")
+axes_ro[0].plot(t_roll_ep1[:N_ROLL], traj_ols[:, 0], "#d62728", lw=1.0,
+                ls=":", label=f"OLS (RMSE={ols_rollout_rmse_x:.3f})")
+axes_ro[0].axvline(ONSET_TIMES[1], color="red", ls="--", lw=0.7, alpha=0.5, label="Onset")
+axes_ro[0].set_ylabel("x (mode 0)")
+axes_ro[0].legend(fontsize=8)
+axes_ro[0].set_title("Rollout: Episode 1, Mode 0")
+axes_ro[0].grid(True, alpha=0.15, linewidth=0.4)
+
+# y trajectory
+axes_ro[1].plot(t_roll_ep1[:N_ROLL], traj_true[:, 1], "k-", lw=1.5, label="True", alpha=0.8)
+axes_ro[1].plot(t_roll_ep1[:N_ROLL], traj_pred[:, 1], "#1f77b4", lw=1.2,
+                ls="--", label="KANDy")
+axes_ro[1].plot(t_roll_ep1[:N_ROLL], traj_ols[:, 1], "#d62728", lw=1.0,
+                ls=":", label="OLS")
+axes_ro[1].axvline(ONSET_TIMES[1], color="red", ls="--", lw=0.7, alpha=0.5)
+axes_ro[1].set_ylabel(r"$\dot{x}$")
+axes_ro[1].set_xlabel("Time (s)")
+axes_ro[1].legend(fontsize=8)
+axes_ro[1].grid(True, alpha=0.15, linewidth=0.4)
+
+fig_ro.tight_layout()
+fig_ro.savefig(f"{OUT_DIR}/rollout.png", dpi=300, bbox_inches="tight")
+fig_ro.savefig(f"{OUT_DIR}/rollout.pdf", dpi=300, bbox_inches="tight")
+plt.close(fig_ro)
+print(f"[PLOT] Saved {OUT_DIR}/rollout.png/pdf")
+
+
+# ------- Plot 4: data_overview.png — Alpha-band SVD modes -------
+fig_do, axes_do = plt.subplots(3, 1, figsize=(10, 8), sharex=False)
 for ep_idx, (modes_ds, xdot_ep, onset_s) in enumerate([
     (modes_1_ds, xdot_1, ONSET_TIMES[1]),
     (modes_2_ds, xdot_2, ONSET_TIMES[2]),
     (modes_3_ds, xdot_3, ONSET_TIMES[3]),
 ]):
     t_ep = np.arange(modes_ds.shape[0]) * dt_ds
-    ax = axes[ep_idx]
+    ax = axes_do[ep_idx]
     ax.plot(t_ep, modes_ds[:, 0], "steelblue", lw=0.8, alpha=0.9, label="x (mode 0)")
-    ax.plot(t_ep, xdot_ep[:, 0], "coral", lw=0.6, alpha=0.7, label="y = x_dot")
-    ax.axvline(onset_s, color="red", ls="--", lw=1.0, alpha=0.7, label=f"Onset {onset_s:.1f}s")
-    ax.axhline(THETA_EST, color="orange", ls=":", lw=0.7, alpha=0.5, label=f"theta={THETA_EST:.2f}")
+    ax.plot(t_ep, xdot_ep[:, 0], "coral", lw=0.6, alpha=0.7, label=r"y = $\dot{x}$")
+    ax.axvline(onset_s, color="red", ls="--", lw=1.0, alpha=0.7,
+               label=f"Onset {onset_s:.1f}s")
+    ax.axhline(THETA_EST, color="orange", ls=":", lw=0.7, alpha=0.5,
+               label=rf"$\theta$={THETA_EST:.2f}")
     ax.set_ylabel(f"Episode {ep_idx+1}")
     ax.legend(fontsize=7, loc="upper left")
+    ax.grid(True, alpha=0.15, linewidth=0.4)
     if ep_idx == 2:
         ax.set_xlabel("Time (s)")
-fig.suptitle(
-    f"Mode 0: Alpha-band ({ALPHA_LOW}-{ALPHA_HIGH} Hz, {SMOOTH_WIN_S}s avg, {fs_ds} Hz)",
+fig_do.suptitle(
+    f"Mode 0: Alpha-band ({ALPHA_LOW}-{ALPHA_HIGH} Hz, "
+    f"{SMOOTH_WIN_S}s avg, {fs_ds} Hz)",
     fontsize=12,
 )
-fig.tight_layout()
-fig.savefig(f"{OUT_DIR}/data_overview.png", dpi=300, bbox_inches="tight")
-fig.savefig(f"{OUT_DIR}/data_overview.pdf", dpi=300, bbox_inches="tight")
-plt.close(fig)
+fig_do.tight_layout()
+fig_do.savefig(f"{OUT_DIR}/data_overview.png", dpi=300, bbox_inches="tight")
+fig_do.savefig(f"{OUT_DIR}/data_overview.pdf", dpi=300, bbox_inches="tight")
+plt.close(fig_do)
 print(f"[PLOT] Saved {OUT_DIR}/data_overview.png/pdf")
 
-# 14b. Phase portrait and target scatter (Mode 0 only)
-fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-# Phase portrait
-axes[0].scatter(features_all[:, 0], features_all[:, 1], s=3, alpha=0.4, c="steelblue")
-axes[0].set_xlabel("x (mode 0)")
-axes[0].set_ylabel("y = x_dot")
-axes[0].set_title("Phase portrait")
-# x vs x_ddot
-axes[1].scatter(features_all[:, 0], targets_all, s=3, alpha=0.4, c="coral")
-axes[1].set_xlabel("x (mode 0)")
-axes[1].set_ylabel("x_ddot")
-axes[1].set_title("x vs target")
-# y vs x_ddot
-axes[2].scatter(features_all[:, 1], targets_all, s=3, alpha=0.4, c="forestgreen")
-axes[2].set_xlabel("y = x_dot")
-axes[2].set_ylabel("x_ddot")
-axes[2].set_title("y vs target")
-fig.suptitle("Mode 0: 2-jet embedding diagnostics", fontsize=12)
-fig.tight_layout()
-fig.savefig(f"{OUT_DIR}/derivative_quality.png", dpi=300, bbox_inches="tight")
-fig.savefig(f"{OUT_DIR}/derivative_quality.pdf", dpi=300, bbox_inches="tight")
-plt.close(fig)
-print(f"[PLOT] Saved {OUT_DIR}/derivative_quality.png/pdf")
 
-# 14c. Edge activations for best model
-fig_edges, axes_edges = plot_all_edges(
-    model.model_,
-    X=sym_in,
-    fits=["linear"],
-    in_var_names=FEATURE_NAMES,
-    out_var_names=["x_ddot"],
-    figsize_per_panel=(3.5, 2.5),
-    save=f"{OUT_DIR}/edge_activations",
-)
-plt.close(fig_edges)
-print(f"[PLOT] Saved {OUT_DIR}/edge_activations.png/pdf")
-
-# 14d. Detailed per-edge plots (individual subplots with more detail)
-fig, axes_detail = plt.subplots(2, 4, figsize=(16, 8))
-for i, ax in enumerate(axes_detail.flat):
+# ------- Plot 5: edge_activations_detail.png — 8-panel edge activations -------
+fig_ed, axes_ed = plt.subplots(2, 4, figsize=(16, 8))
+for i, ax in enumerate(axes_ed.flat):
     if i >= N_FEAT:
         ax.set_visible(False)
         continue
-    x_a, y_a = get_edge_activation(model.model_, l=0, i=i, j=0)
+    x_a, y_a = spline_data[i]
     rng = np.max(y_a) - np.min(y_a)
     is_active = rng > threshold
 
-    # Sort for clean plotting
     order = np.argsort(x_a)
     x_sorted = x_a[order]
     y_sorted = y_a[order]
@@ -992,119 +1564,119 @@ for i, ax in enumerate(axes_detail.flat):
         ax.plot(x_sorted, m_slope * x_sorted + b_int, "r--", lw=0.8, alpha=0.6)
 
     color = "black" if is_active else "gray"
-    status_str = f"ACTIVE (range={rng:.4f})" if is_active else f"zeroed (range={rng:.4f})"
+    status_str = (f"ACTIVE (range={rng:.4f})" if is_active
+                  else f"zeroed (range={rng:.4f})")
     ax.set_title(f"{FEATURE_NAMES[i]}\n{status_str}", fontsize=9, color=color)
     ax.set_xlabel(f"input ({FEATURE_NAMES[i]})", fontsize=8)
     ax.set_ylabel("spline output", fontsize=8)
     ax.tick_params(labelsize=7)
+    ax.grid(True, alpha=0.2, linewidth=0.4)
 
-fig.suptitle(f"Mode 0 KAN edges (grid={best['grid']}, lamb={best['lamb']}, R^2={kandy_r2:.4f})", fontsize=12)
-fig.tight_layout()
-fig.savefig(f"{OUT_DIR}/edge_activations_detail.png", dpi=300, bbox_inches="tight")
-fig.savefig(f"{OUT_DIR}/edge_activations_detail.pdf", dpi=300, bbox_inches="tight")
-plt.close(fig)
+fig_ed.suptitle(
+    f"Mode 0 KAN edges (grid={best['grid']}, lamb={best['lamb']}, "
+    f"R^2={kandy_r2:.4f})",
+    fontsize=12,
+)
+fig_ed.tight_layout()
+fig_ed.savefig(f"{OUT_DIR}/edge_activations_detail.png", dpi=300, bbox_inches="tight")
+fig_ed.savefig(f"{OUT_DIR}/edge_activations_detail.pdf", dpi=300, bbox_inches="tight")
+plt.close(fig_ed)
 print(f"[PLOT] Saved {OUT_DIR}/edge_activations_detail.png/pdf")
 
-# 14e. Loss curves
-fig_loss, ax_loss = plot_loss_curves(
-    model.train_results_,
-    save=f"{OUT_DIR}/loss_curves",
+
+# ------- Plot 6: relu_response.png — Dedicated ReLU edge response -------
+relu_fit = spline_fits[5]
+x_relu, y_relu = relu_fit["x_data"], relu_fit["y_data"]
+order_relu = np.argsort(x_relu)
+x_relu_s = x_relu[order_relu]
+y_relu_s = y_relu[order_relu]
+
+fig_relu, ax_relu = plt.subplots(figsize=(6, 4.5))
+ax_relu.plot(x_relu_s, y_relu_s, color="#1f77b4", lw=2.0, alpha=0.85,
+             label="Learned spline", zorder=2)
+
+# Overlay symbolic fit
+if relu_fit["fit_type"] != "zeroed" and len(relu_fit["y_pred"]) > 0:
+    x_fit_relu = relu_fit.get("x_fit", x_relu)
+    y_pred_relu = relu_fit["y_pred"]
+    order_fit = np.argsort(x_fit_relu)
+    ax_relu.plot(x_fit_relu[order_fit], y_pred_relu[order_fit],
+                 color="#d62728", lw=1.8, ls="--", alpha=0.9,
+                 label=f"Fit: {relu_fit['equation'][:60]}", zorder=3)
+
+ax_relu.set_xlabel(r"ReLU$(x - \theta)$ input", fontsize=11)
+ax_relu.set_ylabel(r"$\psi_5$(ReLU) output", fontsize=11)
+ax_relu.annotate(
+    "Non-monotonic response\nto threshold activation",
+    xy=(0.95, 0.95), xycoords="axes fraction",
+    ha="right", va="top", fontsize=9,
+    bbox=dict(boxstyle="round,pad=0.3", facecolor="wheat", alpha=0.8),
 )
-plt.close(fig_loss)
-print(f"[PLOT] Saved {OUT_DIR}/loss_curves.png/pdf")
+ax_relu.spines["top"].set_visible(False)
+ax_relu.spines["right"].set_visible(False)
+ax_relu.legend(fontsize=8, loc="lower right", framealpha=0.9)
+ax_relu.grid(True, alpha=0.15, linewidth=0.4)
 
-# 14f. One-step prediction scatter
-fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
-# KANDy
-axes[0].scatter(targets_all, X_dot_pred, s=3, alpha=0.3, c="steelblue")
-lims = [min(targets_all.min(), X_dot_pred.min()), max(targets_all.max(), X_dot_pred.max())]
-axes[0].plot(lims, lims, "k--", lw=0.7, alpha=0.5)
-axes[0].set_xlabel("True x_ddot")
-axes[0].set_ylabel("Predicted x_ddot")
-axes[0].set_title(f"KANDy one-step (R^2={kandy_r2:.4f})")
-# OLS
-pred_ols_all = features_ols @ coeffs_ols
-axes[1].scatter(targets_all, pred_ols_all, s=3, alpha=0.3, c="coral")
-axes[1].plot(lims, lims, "k--", lw=0.7, alpha=0.5)
-axes[1].set_xlabel("True x_ddot")
-axes[1].set_ylabel("Predicted x_ddot")
-axes[1].set_title(f"OLS one-step (R^2={ols_r2:.4f})")
-fig.suptitle("One-step prediction: KANDy vs OLS (Mode 0)", fontsize=12)
-fig.tight_layout()
-fig.savefig(f"{OUT_DIR}/onestep.png", dpi=300, bbox_inches="tight")
-fig.savefig(f"{OUT_DIR}/onestep.pdf", dpi=300, bbox_inches="tight")
-plt.close(fig)
-print(f"[PLOT] Saved {OUT_DIR}/onestep.png/pdf")
+fig_relu.tight_layout()
+fig_relu.savefig(f"{OUT_DIR}/relu_response.png", dpi=300, bbox_inches="tight")
+fig_relu.savefig(f"{OUT_DIR}/relu_response.pdf", dpi=300, bbox_inches="tight")
+plt.close(fig_relu)
+print(f"[PLOT] Saved {OUT_DIR}/relu_response.png/pdf")
 
-# 14g. Rollout comparison (Episode 1, Mode 0)
-fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-# x trajectory
-axes[0].plot(t_roll_ep1[:N_ROLL], traj_true[:, 0], "k-", lw=1.5, label="True", alpha=0.8)
-axes[0].plot(t_roll_ep1[:N_ROLL], traj_pred[:, 0], "steelblue", lw=1.2,
-             ls="--", label=f"KANDy (RMSE={rollout_rmse_x:.3f})")
-axes[0].plot(t_roll_ep1[:N_ROLL], traj_ols[:, 0], "coral", lw=1.0,
-             ls=":", label=f"OLS (RMSE={ols_rollout_rmse_x:.3f})")
-axes[0].axvline(ONSET_TIMES[1], color="red", ls="--", lw=0.7, alpha=0.5, label="Onset")
-axes[0].set_ylabel("x (mode 0)")
-axes[0].legend(fontsize=8)
-axes[0].set_title("Rollout: Episode 1, Mode 0")
 
-# y trajectory
-axes[1].plot(t_roll_ep1[:N_ROLL], traj_true[:, 1], "k-", lw=1.5, label="True", alpha=0.8)
-axes[1].plot(t_roll_ep1[:N_ROLL], traj_pred[:, 1], "steelblue", lw=1.2,
-             ls="--", label="KANDy")
-axes[1].plot(t_roll_ep1[:N_ROLL], traj_ols[:, 1], "coral", lw=1.0,
-             ls=":", label="OLS")
-axes[1].axvline(ONSET_TIMES[1], color="red", ls="--", lw=0.7, alpha=0.5)
-axes[1].set_ylabel("y (x_dot)")
-axes[1].set_xlabel("Time (s)")
-axes[1].legend(fontsize=8)
+# ------- Plot 7: coefficient_summary.png — Bar chart of coefficients -------
+active_names = []
+active_coeffs = []
+for fname, info in composed_coeffs.items():
+    active_names.append(fname)
+    active_coeffs.append(info["linear_coeff"])
 
-fig.tight_layout()
-fig.savefig(f"{OUT_DIR}/rollout.png", dpi=300, bbox_inches="tight")
-fig.savefig(f"{OUT_DIR}/rollout.pdf", dpi=300, bbox_inches="tight")
-plt.close(fig)
-print(f"[PLOT] Saved {OUT_DIR}/rollout.png/pdf")
+if active_names:
+    fig_cs, ax_cs = plt.subplots(figsize=(8, 4.5))
+    x_pos = np.arange(len(active_names))
+    colors_bar = ["#1f77b4" if c >= 0 else "#d62728" for c in active_coeffs]
+    bars = ax_cs.bar(x_pos, active_coeffs, color=colors_bar, alpha=0.85,
+                     edgecolor="black", linewidth=0.5)
+    ax_cs.set_xticks(x_pos)
+    ax_cs.set_xticklabels(active_names, fontsize=9, rotation=30, ha="right")
+    ax_cs.set_ylabel("Coefficient (original space)", fontsize=10)
+    ax_cs.axhline(0, color="black", lw=0.5, alpha=0.5)
+    ax_cs.grid(True, axis="y", alpha=0.2, linewidth=0.4)
+    ax_cs.spines["top"].set_visible(False)
+    ax_cs.spines["right"].set_visible(False)
 
-# 14h. Phase portrait overlay (x vs y)
-fig, ax = plt.subplots(figsize=(5, 4.5))
-ax.plot(traj_true[:, 0], traj_true[:, 1], "k-", lw=1.0, alpha=0.4, label="True")
-ax.plot(traj_pred[:, 0], traj_pred[:, 1], "steelblue", lw=1.0, alpha=0.8, label="KANDy")
-ax.plot(traj_ols[:, 0], traj_ols[:, 1], "coral", lw=0.8, alpha=0.7, label="OLS")
-ax.scatter([traj_true[0, 0]], [traj_true[0, 1]], s=50, c="green", zorder=5, label="IC")
-ax.axvline(THETA_EST, color="orange", ls=":", lw=0.7, alpha=0.5, label=f"theta={THETA_EST:.2f}")
-ax.set_xlabel("x (mode 0)")
-ax.set_ylabel("y (x_dot)")
-ax.set_title("Phase portrait: Episode 1, Mode 0")
-ax.legend(fontsize=8)
-fig.tight_layout()
-fig.savefig(f"{OUT_DIR}/phase_portrait.png", dpi=300, bbox_inches="tight")
-fig.savefig(f"{OUT_DIR}/phase_portrait.pdf", dpi=300, bbox_inches="tight")
-plt.close(fig)
-print(f"[PLOT] Saved {OUT_DIR}/phase_portrait.png/pdf")
+    # Add value labels on bars
+    for bar, val in zip(bars, active_coeffs):
+        y_off = 0.01 * max(abs(v) for v in active_coeffs) if active_coeffs else 0.01
+        ax_cs.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + np.sign(val) * y_off,
+                   f"{val:.4f}", ha="center", va="bottom" if val >= 0 else "top",
+                   fontsize=8)
 
-# 14i. ReLU activation check
-fig, ax = plt.subplots(figsize=(6, 5))
-x_m = features_all[:, 0]
-relu_m = features_all[:, 5]
-xdd_m = targets_all
-sc = ax.scatter(x_m, xdd_m, c=relu_m, s=5, alpha=0.5, cmap="YlOrRd")
-ax.axvline(THETA_EST, color="orange", ls="--", lw=1.0, label=f"theta={THETA_EST:.2f}")
-ax.set_xlabel("x (mode 0)")
-ax.set_ylabel("x_ddot")
-ax.set_title("Mode 0: color=ReLU(x-theta)")
-ax.legend(fontsize=8)
-plt.colorbar(sc, ax=ax, label="ReLU(x-theta)")
-fig.tight_layout()
-fig.savefig(f"{OUT_DIR}/relu_activation.png", dpi=300, bbox_inches="tight")
-fig.savefig(f"{OUT_DIR}/relu_activation.pdf", dpi=300, bbox_inches="tight")
-plt.close(fig)
-print(f"[PLOT] Saved {OUT_DIR}/relu_activation.png/pdf")
+    # Add constant as annotation
+    if abs(constant_total) > 1e-6:
+        ax_cs.annotate(
+            f"Constant term: {constant_total:.6f}",
+            xy=(0.02, 0.98), xycoords="axes fraction",
+            ha="left", va="top", fontsize=9,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.9),
+        )
 
-# 14j. Hyperparameter sweep heatmap
-fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig_cs.suptitle(
+        r"Discovered coefficients: $\ddot{x}$ = const + $\sum c_i \cdot$feature$_i$",
+        fontsize=11,
+    )
+    fig_cs.tight_layout()
+    fig_cs.savefig(f"{OUT_DIR}/coefficient_summary.png", dpi=300, bbox_inches="tight")
+    fig_cs.savefig(f"{OUT_DIR}/coefficient_summary.pdf", dpi=300, bbox_inches="tight")
+    plt.close(fig_cs)
+    print(f"[PLOT] Saved {OUT_DIR}/coefficient_summary.png/pdf")
+else:
+    print("[PLOT] No active coefficients for coefficient_summary plot")
 
-# R^2 heatmap
+
+# ------- Plot 8: hyperparameter_sweep.png — Keep existing heatmap -------
+fig_hs, axes_hs = plt.subplots(1, 2, figsize=(12, 5))
+
 r2_grid = np.zeros((len(GRID_VALUES), len(LAMB_VALUES)))
 active_grid = np.zeros((len(GRID_VALUES), len(LAMB_VALUES)))
 for r in sweep_results:
@@ -1113,62 +1685,166 @@ for r in sweep_results:
     r2_grid[gi, li] = r["r2"]
     active_grid[gi, li] = r["n_active"]
 
-im1 = axes[0].imshow(r2_grid, aspect="auto", cmap="RdYlGn", origin="lower")
-axes[0].set_xticks(range(len(LAMB_VALUES)))
-axes[0].set_xticklabels([f"{l}" for l in LAMB_VALUES], fontsize=8, rotation=45)
-axes[0].set_yticks(range(len(GRID_VALUES)))
-axes[0].set_yticklabels([f"grid={g}" for g in GRID_VALUES])
-axes[0].set_xlabel("lamb")
-axes[0].set_title("R^2")
-plt.colorbar(im1, ax=axes[0])
-# Annotate
+im1 = axes_hs[0].imshow(r2_grid, aspect="auto", cmap="RdYlGn", origin="lower")
+axes_hs[0].set_xticks(range(len(LAMB_VALUES)))
+axes_hs[0].set_xticklabels([f"{l}" for l in LAMB_VALUES], fontsize=8, rotation=45)
+axes_hs[0].set_yticks(range(len(GRID_VALUES)))
+axes_hs[0].set_yticklabels([f"grid={g}" for g in GRID_VALUES])
+axes_hs[0].set_xlabel("lamb")
+axes_hs[0].set_title(r"$R^2$")
+plt.colorbar(im1, ax=axes_hs[0])
 for gi in range(len(GRID_VALUES)):
     for li in range(len(LAMB_VALUES)):
-        axes[0].text(li, gi, f"{r2_grid[gi, li]:.3f}", ha="center", va="center", fontsize=7)
+        axes_hs[0].text(li, gi, f"{r2_grid[gi, li]:.3f}",
+                        ha="center", va="center", fontsize=7)
 
-im2 = axes[1].imshow(active_grid, aspect="auto", cmap="Blues", origin="lower")
-axes[1].set_xticks(range(len(LAMB_VALUES)))
-axes[1].set_xticklabels([f"{l}" for l in LAMB_VALUES], fontsize=8, rotation=45)
-axes[1].set_yticks(range(len(GRID_VALUES)))
-axes[1].set_yticklabels([f"grid={g}" for g in GRID_VALUES])
-axes[1].set_xlabel("lamb")
-axes[1].set_title("Active edges (out of 8)")
-plt.colorbar(im2, ax=axes[1])
+im2 = axes_hs[1].imshow(active_grid, aspect="auto", cmap="Blues", origin="lower")
+axes_hs[1].set_xticks(range(len(LAMB_VALUES)))
+axes_hs[1].set_xticklabels([f"{l}" for l in LAMB_VALUES], fontsize=8, rotation=45)
+axes_hs[1].set_yticks(range(len(GRID_VALUES)))
+axes_hs[1].set_yticklabels([f"grid={g}" for g in GRID_VALUES])
+axes_hs[1].set_xlabel("lamb")
+axes_hs[1].set_title("Active edges (out of 8)")
+plt.colorbar(im2, ax=axes_hs[1])
 for gi in range(len(GRID_VALUES)):
     for li in range(len(LAMB_VALUES)):
-        axes[1].text(li, gi, f"{int(active_grid[gi, li])}", ha="center", va="center", fontsize=8)
+        axes_hs[1].text(li, gi, f"{int(active_grid[gi, li])}",
+                        ha="center", va="center", fontsize=8)
 
-fig.suptitle("Hyperparameter sweep: Mode 0 KANDy", fontsize=12)
-fig.tight_layout()
-fig.savefig(f"{OUT_DIR}/hyperparameter_sweep.png", dpi=300, bbox_inches="tight")
-fig.savefig(f"{OUT_DIR}/hyperparameter_sweep.pdf", dpi=300, bbox_inches="tight")
-plt.close(fig)
+fig_hs.suptitle("Hyperparameter sweep: Mode 0 KANDy", fontsize=12)
+fig_hs.tight_layout()
+fig_hs.savefig(f"{OUT_DIR}/hyperparameter_sweep.png", dpi=300, bbox_inches="tight")
+fig_hs.savefig(f"{OUT_DIR}/hyperparameter_sweep.pdf", dpi=300, bbox_inches="tight")
+plt.close(fig_hs)
 print(f"[PLOT] Saved {OUT_DIR}/hyperparameter_sweep.png/pdf")
 
-# 14k. SVD spectrum
-fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-axes[0].semilogy(S[:20], "ko-", markersize=4)
-axes[0].set_xlabel("Component")
-axes[0].set_ylabel("Singular value")
-axes[0].set_title("SVD spectrum")
-axes[0].axhline(S[0], color="r", ls="--", alpha=0.5, label=f"Mode 0: {S[0]:.1f}")
-axes[0].legend(fontsize=8)
 
-axes[1].plot(cumvar[:20], "ko-", markersize=4)
-axes[1].set_xlabel("Number of components")
-axes[1].set_ylabel("Cumulative variance (%)")
-axes[1].set_title("Cumulative explained variance")
-axes[1].axhline(cumvar[0], color="r", ls="--", alpha=0.5,
-                label=f"Mode 0: {cumvar[0]:.1f}%")
-axes[1].legend(fontsize=8)
-fig.tight_layout()
-fig.savefig(f"{OUT_DIR}/svd_spectrum.png", dpi=300, bbox_inches="tight")
-fig.savefig(f"{OUT_DIR}/svd_spectrum.pdf", dpi=300, bbox_inches="tight")
-plt.close(fig)
+# ------- Additional diagnostic plots (keep from original) -------
+# Edge activations via plot_all_edges
+fig_edges, axes_edges = plot_all_edges(
+    model.model_,
+    X=sym_input_full,
+    fits=["linear"],
+    in_var_names=FEATURE_NAMES,
+    out_var_names=["x_ddot"],
+    figsize_per_panel=(3.5, 2.5),
+    save=f"{OUT_DIR}/edge_activations",
+)
+plt.close(fig_edges)
+print(f"[PLOT] Saved {OUT_DIR}/edge_activations.png/pdf")
+
+# Loss curves
+fig_loss, ax_loss = plot_loss_curves(
+    model.train_results_,
+    save=f"{OUT_DIR}/loss_curves",
+)
+plt.close(fig_loss)
+print(f"[PLOT] Saved {OUT_DIR}/loss_curves.png/pdf")
+
+# One-step prediction scatter
+fig_os, axes_os = plt.subplots(1, 2, figsize=(10, 4.5))
+axes_os[0].scatter(targets_all, X_dot_pred, s=3, alpha=0.3, c="steelblue")
+lims = [min(targets_all.min(), X_dot_pred.min()),
+        max(targets_all.max(), X_dot_pred.max())]
+axes_os[0].plot(lims, lims, "k--", lw=0.7, alpha=0.5)
+axes_os[0].set_xlabel(r"True $\ddot{x}$")
+axes_os[0].set_ylabel(r"Predicted $\ddot{x}$")
+axes_os[0].set_title(f"KANDy one-step ($R^2$={kandy_r2:.4f})")
+pred_ols_all = features_ols @ coeffs_ols
+axes_os[1].scatter(targets_all, pred_ols_all, s=3, alpha=0.3, c="coral")
+axes_os[1].plot(lims, lims, "k--", lw=0.7, alpha=0.5)
+axes_os[1].set_xlabel(r"True $\ddot{x}$")
+axes_os[1].set_ylabel(r"Predicted $\ddot{x}$")
+axes_os[1].set_title(f"OLS one-step ($R^2$={ols_r2:.4f})")
+fig_os.suptitle("One-step prediction: KANDy vs OLS (Mode 0)", fontsize=12)
+fig_os.tight_layout()
+fig_os.savefig(f"{OUT_DIR}/onestep.png", dpi=300, bbox_inches="tight")
+fig_os.savefig(f"{OUT_DIR}/onestep.pdf", dpi=300, bbox_inches="tight")
+plt.close(fig_os)
+print(f"[PLOT] Saved {OUT_DIR}/onestep.png/pdf")
+
+# Phase portrait and target scatter
+fig_dq, axes_dq = plt.subplots(1, 3, figsize=(14, 4))
+axes_dq[0].scatter(features_all[:, 0], features_all[:, 1], s=3, alpha=0.4, c="steelblue")
+axes_dq[0].set_xlabel("x (mode 0)")
+axes_dq[0].set_ylabel(r"y = $\dot{x}$")
+axes_dq[0].set_title("Phase portrait")
+axes_dq[1].scatter(features_all[:, 0], targets_all, s=3, alpha=0.4, c="coral")
+axes_dq[1].set_xlabel("x (mode 0)")
+axes_dq[1].set_ylabel(r"$\ddot{x}$")
+axes_dq[1].set_title("x vs target")
+axes_dq[2].scatter(features_all[:, 1], targets_all, s=3, alpha=0.4, c="forestgreen")
+axes_dq[2].set_xlabel(r"y = $\dot{x}$")
+axes_dq[2].set_ylabel(r"$\ddot{x}$")
+axes_dq[2].set_title("y vs target")
+fig_dq.suptitle("Mode 0: 2-jet embedding diagnostics", fontsize=12)
+fig_dq.tight_layout()
+fig_dq.savefig(f"{OUT_DIR}/derivative_quality.png", dpi=300, bbox_inches="tight")
+fig_dq.savefig(f"{OUT_DIR}/derivative_quality.pdf", dpi=300, bbox_inches="tight")
+plt.close(fig_dq)
+print(f"[PLOT] Saved {OUT_DIR}/derivative_quality.png/pdf")
+
+# Phase portrait overlay (x vs y)
+fig_pp, ax_pp = plt.subplots(figsize=(5, 4.5))
+ax_pp.plot(traj_true[:, 0], traj_true[:, 1], "k-", lw=1.0, alpha=0.4, label="True")
+ax_pp.plot(traj_pred[:, 0], traj_pred[:, 1], "#1f77b4", lw=1.0, alpha=0.8, label="KANDy")
+ax_pp.plot(traj_ols[:, 0], traj_ols[:, 1], "#d62728", lw=0.8, alpha=0.7, label="OLS")
+ax_pp.scatter([traj_true[0, 0]], [traj_true[0, 1]], s=50, c="#2ca02c", zorder=5, label="IC")
+ax_pp.axvline(THETA_EST, color="#ff7f0e", ls=":", lw=0.7, alpha=0.5,
+              label=rf"$\theta$={THETA_EST:.2f}")
+ax_pp.set_xlabel("x (mode 0)")
+ax_pp.set_ylabel(r"y ($\dot{x}$)")
+ax_pp.set_title("Phase portrait: Episode 1, Mode 0")
+ax_pp.legend(fontsize=8)
+fig_pp.tight_layout()
+fig_pp.savefig(f"{OUT_DIR}/phase_portrait.png", dpi=300, bbox_inches="tight")
+fig_pp.savefig(f"{OUT_DIR}/phase_portrait.pdf", dpi=300, bbox_inches="tight")
+plt.close(fig_pp)
+print(f"[PLOT] Saved {OUT_DIR}/phase_portrait.png/pdf")
+
+# ReLU activation check
+fig_ra, ax_ra = plt.subplots(figsize=(6, 5))
+x_m = features_all[:, 0]
+relu_m = features_all[:, 5]
+xdd_m = targets_all
+sc = ax_ra.scatter(x_m, xdd_m, c=relu_m, s=5, alpha=0.5, cmap="YlOrRd")
+ax_ra.axvline(THETA_EST, color="orange", ls="--", lw=1.0,
+              label=rf"$\theta$={THETA_EST:.2f}")
+ax_ra.set_xlabel("x (mode 0)")
+ax_ra.set_ylabel(r"$\ddot{x}$")
+ax_ra.set_title(r"Mode 0: color = ReLU$(x - \theta)$")
+ax_ra.legend(fontsize=8)
+plt.colorbar(sc, ax=ax_ra, label=r"ReLU$(x-\theta)$")
+fig_ra.tight_layout()
+fig_ra.savefig(f"{OUT_DIR}/relu_activation.png", dpi=300, bbox_inches="tight")
+fig_ra.savefig(f"{OUT_DIR}/relu_activation.pdf", dpi=300, bbox_inches="tight")
+plt.close(fig_ra)
+print(f"[PLOT] Saved {OUT_DIR}/relu_activation.png/pdf")
+
+# SVD spectrum
+fig_sv, axes_sv = plt.subplots(1, 2, figsize=(10, 4))
+axes_sv[0].semilogy(S[:20], "ko-", markersize=4)
+axes_sv[0].set_xlabel("Component")
+axes_sv[0].set_ylabel("Singular value")
+axes_sv[0].set_title("SVD spectrum")
+axes_sv[0].axhline(S[0], color="r", ls="--", alpha=0.5, label=f"Mode 0: {S[0]:.1f}")
+axes_sv[0].legend(fontsize=8)
+axes_sv[1].plot(cumvar[:20], "ko-", markersize=4)
+axes_sv[1].set_xlabel("Number of components")
+axes_sv[1].set_ylabel("Cumulative variance (%)")
+axes_sv[1].set_title("Cumulative explained variance")
+axes_sv[1].axhline(cumvar[0], color="r", ls="--", alpha=0.5,
+                   label=f"Mode 0: {cumvar[0]:.1f}%")
+axes_sv[1].legend(fontsize=8)
+fig_sv.tight_layout()
+fig_sv.savefig(f"{OUT_DIR}/svd_spectrum.png", dpi=300, bbox_inches="tight")
+fig_sv.savefig(f"{OUT_DIR}/svd_spectrum.pdf", dpi=300, bbox_inches="tight")
+plt.close(fig_sv)
 print(f"[PLOT] Saved {OUT_DIR}/svd_spectrum.png/pdf")
 
+
 # ---------------------------------------------------------------------------
-# 15. Summary
+# 17. Summary
 # ---------------------------------------------------------------------------
 print(f"\n{'='*70}")
 print(f"  SUMMARY: Mode 0 Duffing-ReLU Oscillator for iEEG")
@@ -1198,8 +1874,28 @@ print(f"""
   Rollout (Ep1, Mode 0):
     KANDy RMSE:   {rollout_rmse:.4f} (NRMSE={nrmse:.4f})
     OLS RMSE:     {ols_rollout_rmse:.4f} (NRMSE={ols_nrmse:.4f})
-
-  Output:         {OUT_DIR}/
 """)
 
+print(f"  Discovered equation (linear approximation of splines):")
+print(f"    x_ddot = {full_eq}")
+print()
+
+print(f"  Spline symbolic fits:")
+print(f"  {'Edge':25s} {'Type':12s} {'R^2':>6s} {'Equation'}")
+print(f"  {'-'*25} {'-'*12} {'-'*6} {'-'*40}")
+for i in range(N_FEAT):
+    fit = spline_fits[i]
+    eq_short = fit['equation'][:50]
+    print(f"  {FEATURE_NAMES[i]:25s} {fit['fit_type']:12s} "
+          f"{fit['r2']:6.3f} {eq_short}")
+
+print(f"\n  Composed coefficients (original space):")
+print(f"  {'Term':25s} {'Coefficient':>15s} {'Spline R^2':>10s}")
+print(f"  {'-'*25} {'-'*15} {'-'*10}")
+if abs(constant_total) > 1e-6:
+    print(f"  {'constant':25s} {constant_total:+15.6f}")
+for fname, info in composed_coeffs.items():
+    print(f"  {fname:25s} {info['linear_coeff']:+15.6f} {info['fit_r2']:10.4f}")
+
+print(f"\n  Output: {OUT_DIR}/")
 print(f"\n[DONE] All results saved to {OUT_DIR}/")
