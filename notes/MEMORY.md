@@ -15,6 +15,15 @@ KANDy = Kolmogorov-Arnold Networks for Dynamics. Replaces SINDy's sparse regress
 - `results/` - ALL outputs, organized by system: Burgers/, Burgers-Fourier/, Kuramoto/
 - `model/` - Trained KAN checkpoints (v0.0-0.3)
 
+## Notes Directory
+Detailed experiment write-ups live in `notes/`. Always check here for context before running experiments.
+- [pdefind_comparison.md](pdefind_comparison.md) — PDE-FIND vs KANDy on Burgers: KANDy wins (2 terms, NRMSE=0.049), PDE-FIND fails on shock data, derivative method lessons, symbolic extraction procedure (2026-03-17)
+- [ikeda.md](ikeda.md) — Ikeda map results
+- [ks.md](ks.md) — Kuramoto-Sivashinsky results
+- [adaptive_kuramoto.md](adaptive_kuramoto.md) — Adaptive Kuramoto results
+- [ieeg.md](ieeg.md) — iEEG seizure data analysis
+- [ieeg_duffing_relu_2026-03-12.md](ieeg_duffing_relu_2026-03-12.md) — iEEG Duffing-ReLU model
+
 ## Output Conventions
 - All results to `results/<SystemName>/`, baselines to `results/<SystemName>/baselines/`
 - Plots: PNG + PDF at 300 dpi, `kandy.plotting.use_pub_style()`
