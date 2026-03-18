@@ -358,11 +358,7 @@ def fit_kan(
     # PyKAN symbolic / regularisation setup
     # ------------------------------------------------------------------
     if lamb > 0.0 and not model.save_act:
-        print(
-            "[fit_kan] Warning: lamb > 0 but model.save_act is False. "
-            "Setting lamb=0.  Set model.save_act=True to enable regularisation."
-        )
-        lamb = 0.0
+        model.save_act = True
 
     old_save_act, old_symbolic_enabled = model.disable_symbolic_in_fit(lamb)
 

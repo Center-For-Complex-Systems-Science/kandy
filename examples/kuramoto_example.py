@@ -368,4 +368,20 @@ if hasattr(model, "train_results_") and model.train_results_ is not None:
     )
     plt.close(fig)
 
+# 8d. PyKAN architecture plot with symbolic formulas on edges
+in_vars = [rf"$s_{{{i}{j}}}$" for (i, j) in PAIRS]
+out_vars = [rf"$\dot{{\theta}}_{i}$" for i in range(N)]
+try:
+    model.model_.plot(
+        in_vars=in_vars,
+        out_vars=out_vars,
+        title="Kuramoto KAN",
+    )
+    plt.savefig("results/Kuramoto/kan_architecture.png", dpi=300, bbox_inches="tight")
+    plt.savefig("results/Kuramoto/kan_architecture.pdf", dpi=300, bbox_inches="tight")
+    plt.close()
+    print("[FIGS]  Saved results/Kuramoto/kan_architecture.png")
+except Exception as e:
+    print(f"[WARN] KAN architecture plot failed: {e}")
+
 print("[FIGS]  Saved results/Kuramoto/")
