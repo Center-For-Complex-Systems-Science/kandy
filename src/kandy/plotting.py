@@ -220,89 +220,11 @@ def fit_sine(
     return {"name": "sine", "params": params, "y_hat": y_hat, "r2": r2, "label": label}
 
 
-def fit_sech2(
-    x: np.ndarray, y: np.ndarray
-) -> dict:
-    """Fit y = a - A*sech²((x-x0)/ell)  (even, dip-shaped shock profile).
-
-    This shape arises naturally in edge activations for the inviscid Burgers
-    equation and other PDE shock solutions.
-    """
-    def _model(x, a, A, x0, ell):
-        z = (x - x0) / np.maximum(np.abs(ell), 1e-12)
-        return a - A * (1.0 / np.cosh(z)) ** 2
-
-    a0  = np.median(y)
-    A0  = a0 - np.min(y)
-    x0_0 = x[np.argmin(y)]
-    ell0 = np.std(x) / 5.0 or 1.0
-    p0 = [a0, A0, x0_0, ell0]
-    bounds = ([-np.inf, -np.inf, x.min() - 1e-6, 1e-6],
-              [ np.inf,  np.inf, x.max() + 1e-6, np.inf])
-    p0 = [np.clip(p, lo + 1e-8, hi - 1e-8) for p, lo, hi in zip(p0, bounds[0], bounds[1])]
-
-    try:
-        params, _ = curve_fit(_model, x, y, p0=p0, bounds=bounds, maxfev=200_000)
-    except (RuntimeError, ValueError):
-        params = np.array(p0)
-
-    y_hat = _model(x, *params)
-    ss_res = np.sum((y - y_hat) ** 2)
-    ss_tot = np.sum((y - np.mean(y)) ** 2)
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
-    a, A, x0, ell = params
-    label = f"sech²: {a:.3f} − {A:.3f}·sech²((x−{x0:.3f})/{ell:.3f})  ($R^2$={r2:.3f})"
-    return {"name": "sech2", "params": params, "y_hat": y_hat, "r2": r2, "label": label,
-            "_model": _model}
-
-
-def fit_sech2_tanh(
-    x: np.ndarray, y: np.ndarray
-) -> dict:
-    """Fit y = c + K*sech²((x-x0)/ell)*tanh((x-x0)/ell)  (odd shock shape).
-
-    This is the derivative of the sech² profile and corresponds to the
-    u*u_x term in Burgers' equation edge activations.
-    """
-    def _model(x, c, K, x0, ell):
-        z = (x - x0) / np.maximum(np.abs(ell), 1e-12)
-        return c + K * (1.0 / np.cosh(z)) ** 2 * np.tanh(z)
-
-    # Initial guesses: odd function, so median ≈ c, amplitude from peak
-    c0 = np.median(y)
-    # Estimate x0 as zero-crossing of (y - c0)
-    y_centered = y - c0
-    zero_cross = x[np.argmin(np.abs(y_centered))]
-    x0_0 = zero_cross
-    ell0 = np.std(x) / 8.0 or 1.0
-    K0 = np.sign(np.corrcoef(x - x0_0, y_centered)[0, 1] + 1e-12) * np.ptp(y)
-    p0 = [c0, K0, x0_0, ell0]
-    bounds = ([-np.inf, -np.inf, x.min() - 1e-6, 1e-6],
-              [ np.inf,  np.inf, x.max() + 1e-6, np.inf])
-    # Clamp initial guess to be inside bounds
-    p0 = [np.clip(p, lo + 1e-8, hi - 1e-8) for p, lo, hi in zip(p0, bounds[0], bounds[1])]
-
-    try:
-        params, _ = curve_fit(_model, x, y, p0=p0, bounds=bounds, maxfev=200_000)
-    except (RuntimeError, ValueError):
-        params = np.array(p0)
-
-    y_hat = _model(x, *params)
-    ss_res = np.sum((y - y_hat) ** 2)
-    ss_tot = np.sum((y - np.mean(y)) ** 2)
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
-    c, K, x0, ell = params
-    label = f"sech²·tanh: {c:.3f} + {K:.3f}·sech²·tanh  ($R^2$={r2:.3f})"
-    return {"name": "sech2_tanh", "params": params, "y_hat": y_hat, "r2": r2,
-            "label": label, "_model": _model}
-
 
 _FIT_REGISTRY = {
     "linear":     fit_linear,
     "polynomial": fit_polynomial,
     "sine":       fit_sine,
-    "sech2":      fit_sech2,
-    "sech2_tanh": fit_sech2_tanh,
 }
 
 

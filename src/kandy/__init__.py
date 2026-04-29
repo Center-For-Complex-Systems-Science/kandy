@@ -17,10 +17,8 @@ Quick start
 from .core import KANDy
 from .lifts import (
     CustomLift,
-    DelayEmbedding,
     DMDLift,
     FourierLift,
-    KANELift,
     Lift,
     PolynomialLift,
     RadialBasisLift,
@@ -80,8 +78,6 @@ from .plotting import (
     fit_linear,
     fit_polynomial,
     fit_sine,
-    fit_sech2,
-    fit_sech2_tanh,
     use_pub_style,
 )
 
@@ -91,12 +87,10 @@ __all__ = [
     # lifts
     "Lift",
     "PolynomialLift",
-    "DelayEmbedding",
     "CustomLift",
     "FourierLift",
     "RadialBasisLift",
     "DMDLift",
-    "KANELift",         # EXPERIMENTAL
     # numerics
     "burgers_flux",
     "burgers_speed",
@@ -148,7 +142,5 @@ __all__ = [
     "fit_linear",
     "fit_polynomial",
     "fit_sine",
-    "fit_sech2",
-    "fit_sech2_tanh",
     "use_pub_style",
 ]

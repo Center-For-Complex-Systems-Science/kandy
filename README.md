@@ -29,10 +29,31 @@ spline map learned by the KAN, and **A** is the extracted linear mixing matrix.
 
 ---
 
+## Reproduction Instructions
+
+List the systems
+```{bash}
+uv run kandy --list 
+```
+
+
+```{bash}
+uv run kandy burgers 
+```
+The original research code used to develop this entire system is available in `research_code`. The coding examples
+were refactored into this format in order to use it with AI Agents using claude code. Our analysis posits that
+AI agents are more stable for comparing methods that require hyperparameter tuning. The agent memore is stored in
+.claude directory. One may install claude code and load the local agents using the following command:
+
+```{bash}
+claude code .
+```
+
+
 ## Installation
 
 ```bash
-pip install kandy
+pip install -e .
 ```
 
 **Requirements:** Python 3.11–3.13 · PyTorch ≥ 2.0 · PyKAN ≥ 0.2.0 · SciPy ≥ 1.10 · SymPy ≥ 1.12 · NumPy ≥ 1.24 · Matplotlib ≥ 3.7
@@ -185,9 +206,7 @@ incorrect, not merely inaccurate.
 | `FourierLift(n_modes)` | DC + Re/Im parts of leading Fourier modes. For periodic PDE fields (u ∈ ℝᴺ). | 1 + 2·n\_modes |
 | `RadialBasisLift(n_centers, sigma, center_method)` | Gaussian RBF dictionary. Auto σ via median-distance heuristic. Centres from random subsampling or k-means. | n\_centers |
 | `DMDLift(n_modes, dictionary, sort_by)` | EDMD-based Koopman eigenfunctions from trajectory data. Separates real and complex-conjugate pairs. | n\_real + 2·n\_complex |
-| `DelayEmbedding(delays)` | Takens-style delay embedding for scalar time series | len(delays) |
 | `CustomLift(fn, output_dim)` | Wrap any hand-crafted feature function | user-specified |
-| `KANELift(latent_dim, hidden_dim)` | **[EXPERIMENTAL]** Learns φ as a KAN autoencoder; encoder is symbolically extractable after training | latent_dim |
 
 ```python
 from kandy import PolynomialLift, FourierLift, RadialBasisLift, DMDLift, CustomLift
@@ -241,16 +260,6 @@ model.fit(
 Use **LBFGS** for most systems (default). Use **Adam** for large datasets or discrete-map
 training with many parameters (e.g. Holling Type II, Ikeda with rollout).
 
-### Periodic Phases (Kuramoto)
-
-For systems with periodic state variables, use `angle_mse` as the rollout loss so that
-phase differences are correctly wrapped to (−π, π] before squaring:
-
-```python
-from kandy import angle_mse
-model.fit(X, X_dot, rollout_weight=0.3, rollout_loss_fn=angle_mse)
-```
-
 ### Discrete Maps
 
 Pass the current state as `X` and the next state as `X_dot`. KANDy learns the one-step
@@ -270,7 +279,7 @@ def discrete_rhs(state):
 fit_kan(model.model_, dataset, integrator="euler", dynamics_fn=discrete_rhs, ...)
 ```
 
-### Rollout Loss — Advanced
+### Rollout Loss
 
 `fit_kan` accepts a full trajectory dataset for multi-step loss:
 
@@ -295,7 +304,6 @@ fit_kan(
     rollout_horizon=15,
     dynamics_fn=my_dynamics_fn,   # state → derivative (must apply lift internally)
     integrator="rk4",             # "rk4" or "euler"
-    rollout_loss_fn=angle_mse,    # optional; defaults to MSE
 )
 ```
 
@@ -471,12 +479,9 @@ Example scripts for all ten are in [`examples/`](examples/).
 | Hopf fibration | Map S³ → S² | Identity / 5D engineered | LBFGS |
 | Hénon map | Discrete map | [x, y, x²] | LBFGS |
 | Ikeda optical cavity | Discrete map | 4D trig physics lift | LBFGS + rollout |
-| Holling Type II (Rosenzweig–MacArthur) | ODE | 21D physics library | Adam |
-| Adaptive Kuramoto | ODE (periodic phases) | 20D coupled | LBFGS + `angle_mse` |
 | Kuramoto–Sivashinsky | PDE | 12D local features | LBFGS |
 | Inviscid Burgers | PDE | [u, u_x, ∂(u²/2)/∂x] | LBFGS |
 | Burgers (Fourier ICs) | PDE | [u, u_x, ∂(u²/2)/∂x] | LBFGS |
-| Navier–Stokes (ABC flow) | PDE (3D) | 12D vorticity/velocity | LBFGS |
 
 ---
 
@@ -504,9 +509,7 @@ PolynomialLift(degree, include_bias=True)
 FourierLift(n_modes)
 RadialBasisLift(n_centers, sigma=None, center_method='random')
 DMDLift(n_modes, dictionary=None, sort_by='magnitude')
-DelayEmbedding(delays)
 CustomLift(fn, output_dim, name='custom')
-KANELift(latent_dim, hidden_dim=None, grid=5, k=3)   # EXPERIMENTAL
 ```
 
 All lifts inherit from `Lift` (ABC) and implement `__call__(X)`, `output_dim`, and
@@ -558,15 +561,3 @@ euler_step(f, x, dt)                # differentiable Euler step (torch)
 integrate_trajectory(f, x0, t)      # integrate over time array t (torch)
 rk4_integrate_numpy(f, x0, T, dt)  # post-fit numpy rollout for figures
 ```
-
----
-
-## References
-
-[1] Liu et al., "KAN: Kolmogorov-Arnold Networks," arXiv:2404.19756, 2024.
-
-[2] Brunton et al., "Discovering governing equations from data by sparse identification
-of nonlinear dynamical systems," PNAS, 2016.
-
-[3] Williams et al., "A data-driven approximation of the Koopman operator using Extended
-Dynamic Mode Decomposition," JNLS, 2015.

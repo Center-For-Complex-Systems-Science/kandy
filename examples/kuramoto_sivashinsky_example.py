@@ -4,23 +4,18 @@
 The KS equation:
     u_t + u*u_x + u_xx + u_xxxx = 0
 
-is a paradigmatic chaotic PDE.  We discretise on a periodic domain [0, L]
-with N_x spatial modes and treat the full spatial state u ∈ R^{N_x} as a
-single snapshot.  The Koopman lift builds a 6-feature library at each
-spatial point using *spectral* derivatives, and a KAN([6, 1]) learns the
-universal point-wise operator:
+on a periodic domain [0, L) with L=64, Nx=128.
 
-    u_t(x) = f( u, u_x, u_xx, u_xxxx, u·u_x, u·u_xx )
+Feature library (12 features per spatial point):
+    [u, u_x, u_xx, u_xxxx, u², u³, u_x², u_xx², u*u_x, u*u_xx, u*u_xxxx, u_x*u_xx]
 
-Key design choices:
-- **Spectral derivatives** (exact on periodic domains) instead of FD.
-- **Minimal library** — no squared features (u_xx², u_x², etc.) which
-  create degenerate solutions where the KAN splits a linear activation
-  across correlated edges.
-- **ETDRK4** (Kassam & Trefethen, 2005) for data generation and rollout.
+KAN = [12, 1] with grid=10, k=5, RBF base.
 
-Each row of the training data is one (space, time) sample, so the KAN
-effectively discovers the structure of the KS equation in closed form.
+Spatial derivatives via periodic finite-difference matrices.
+Data generated with scipy BDF solver.
+
+This example uses the lower-level ``fit_kan`` API directly because the PDE
+rollout dynamics function requires spatial derivative computation.
 """
 
 import os
@@ -30,8 +25,11 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+from kan import KAN
+import sympy as sp
 
-from kandy import KANDy, CustomLift
+from kandy.training import fit_kan
 from kandy.plotting import (
     plot_all_edges,
     plot_loss_curves,
@@ -41,326 +39,349 @@ from kandy.plotting import (
 # ---------------------------------------------------------------------------
 # 0. Reproducibility
 # ---------------------------------------------------------------------------
-SEED = 42
+SEED = 0
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+
+device = torch.device("cpu")
 
 # ---------------------------------------------------------------------------
 # 1. Problem parameters
 # ---------------------------------------------------------------------------
-L     = 22.0          # domain length (chaotic regime for L≈22)
-N_X   = 64            # spatial grid points
-DT    = 0.25          # time step
-N_STEPS = 8_000       # total steps
-BURN    = 1_000       # transient to discard
+L = 64.0
+NX = 128
+DX = L / NX
+x_grid = np.arange(0.0, L, DX)
 
-x_grid = np.linspace(0, L, N_X, endpoint=False)
-dx     = L / N_X
-
-# Wavenumbers for spectral derivatives
-k = 2.0 * np.pi / L * np.fft.rfftfreq(N_X, d=1.0 / N_X)
+T_SPIN = 100.0
+T_TRAIN = 20.0
+DT = 0.1
+t_all = np.linspace(0.0, T_SPIN + T_TRAIN, int(round((T_SPIN + T_TRAIN) / DT)) + 1)
 
 # ---------------------------------------------------------------------------
-# 2. ETDRK4 pseudo-spectral solver  (Kassam & Trefethen, 2005)
+# 2. Periodic finite-difference derivative matrices
 # ---------------------------------------------------------------------------
-# KS: u_t = -u*u_x - u_xx - u_xxxx
-# Linear: L_hat = k² - k⁴  (grows for |k|<1, decays otherwise)
-# Nonlinear: N(u) = -1/2 d/dx(u²)
+def periodic_shift_mat(N, k):
+    M = np.zeros((N, N), dtype=np.float64)
+    for i in range(N):
+        M[i, (i + k) % N] = 1.0
+    return M
 
-L_hat = k ** 2 - k ** 4   # linear eigenvalues in Fourier space
+I_mat = np.eye(NX, dtype=np.float64)
+Sp = periodic_shift_mat(NX, +1)
+Sm = periodic_shift_mat(NX, -1)
+Spp = periodic_shift_mat(NX, +2)
+Smm = periodic_shift_mat(NX, -2)
 
-# Precompute ETDRK4 coefficients via contour integrals (avoids cancellation)
-_M = 32
-_r  = np.exp(2j * np.pi * (np.arange(1, _M + 1) - 0.5) / _M)
-_LR = DT * L_hat[:, None] + _r[None, :]
-
-E    = np.exp(L_hat * DT)
-E2   = np.exp(L_hat * DT / 2)
-Q    = DT * np.mean((np.exp(_LR / 2) - 1) / _LR, axis=1).real
-f1   = DT * np.mean((-4 - _LR + np.exp(_LR) * (4 - 3 * _LR + _LR**2)) / _LR**3, axis=1).real
-f2   = DT * np.mean((2 + _LR + np.exp(_LR) * (-2 + _LR)) / _LR**3, axis=1).real
-f3   = DT * np.mean((-4 - 3 * _LR - _LR**2 + np.exp(_LR) * (4 - _LR)) / _LR**3, axis=1).real
+Dx_mat = (Sp - Sm) / (2.0 * DX)
+Dxx_mat = (Sp - 2.0 * I_mat + Sm) / (DX**2)
+Dxxxx_mat = (Smm - 4.0 * Sm + 6.0 * I_mat - 4.0 * Sp + Spp) / (DX**4)
 
 
-def ks_nl(u_hat: np.ndarray) -> np.ndarray:
-    """KS nonlinear term in Fourier space: N(u) = -1/2 ik FFT(u²)."""
-    u = np.fft.irfft(u_hat, n=N_X)
-    return -0.5 * (1j * k) * np.fft.rfft(u ** 2)
+def ks_rhs_np(_t, u):
+    ux = Dx_mat @ u
+    uxx = Dxx_mat @ u
+    uxxxx = Dxxxx_mat @ u
+    return -(u * ux) - uxx - uxxxx
 
-
-def ks_etdrk4_step(u_hat: np.ndarray) -> np.ndarray:
-    """One ETDRK4 step (dt is baked into the precomputed coefficients)."""
-    Nu  = ks_nl(u_hat)
-    a   = E2 * u_hat + Q * Nu
-    Na  = ks_nl(a)
-    b   = E2 * u_hat + Q * Na
-    Nb  = ks_nl(b)
-    c   = E2 * a + Q * (2 * Nb - Nu)
-    Nc  = ks_nl(c)
-    return E * u_hat + Nu * f1 + 2 * (Na + Nb) * f2 + Nc * f3
-
-
-def generate_ks_data(n_steps: int = N_STEPS, burn: int = BURN,
-                     seed: int = SEED):
-    """Generate KS trajectory.
-
-    Returns
-    -------
-    U : (n_steps - burn, N_X) real snapshots
-    UH : (n_steps - burn, N_X//2+1) complex Fourier coefficients
-    """
-    rng = np.random.default_rng(seed)
-    u0  = rng.standard_normal(N_X) * 0.1
-    u0 -= u0.mean()
-    u_hat = np.fft.rfft(u0)
-
-    snapshots = []
-    fourier_snapshots = []
-    for step in range(n_steps):
-        u_hat = ks_etdrk4_step(u_hat)
-        if step >= burn:
-            snapshots.append(np.fft.irfft(u_hat, n=N_X).real)
-            fourier_snapshots.append(u_hat.copy())
-
-    return (np.array(snapshots, dtype=np.float64),
-            np.array(fourier_snapshots))
-
-
-print("[DATA]  Generating KS trajectory ...")
-U, UH = generate_ks_data()     # (T, N_X), (T, N_X//2+1)
-T_snap = U.shape[0]
-print(f"[DATA]  T={T_snap} snapshots, N_x={N_X} modes")
 
 # ---------------------------------------------------------------------------
-# 3. Feature library  phi: u ∈ R^{N_x} → theta ∈ R^{N_x × 6}
-#
-#    At every spatial point the 6-dimensional feature vector is:
-#    [u, u_x, u_xx, u_xxxx, u·u_x, u·u_xx]
-#
-#    IMPORTANT: No squared features (u_xx², u_x², etc.).  Including both
-#    u_xx and u_xx² creates a degeneracy where the KAN splits the u_xx
-#    activation across both edges (one quadratic, one linear) that cancel.
-#    This leads to incorrect symbolic extraction (x² instead of x).
+# 3. Generate training data (scipy BDF with spin-up)
 # ---------------------------------------------------------------------------
-FEATURE_NAMES = ["u", "u_x", "u_xx", "u_xxxx", "u*u_x", "u*u_xx"]
-N_FEATURES = 6
+print("[DATA]  Generating KS data with spin-up (SciPy BDF) ...")
+u0_init = (np.cos(2 * np.pi * x_grid / L) + 0.1 * np.random.randn(NX)).astype(np.float64)
 
+sol = solve_ivp(
+    ks_rhs_np, (0.0, T_SPIN + T_TRAIN), u0_init,
+    t_eval=t_all, method="BDF",
+    rtol=1e-6, atol=1e-8,
+)
+if not sol.success:
+    raise RuntimeError(f"SciPy solve_ivp failed: {sol.message}")
 
-def build_ks_library(U_snap: np.ndarray, UH_snap: np.ndarray) -> np.ndarray:
-    """Build feature matrix using *spectral* derivatives.
+U_all = sol.y.T  # (Nt_all, Nx)
+spin_idx = int(round(T_SPIN / DT))
+U_true = U_all[spin_idx:]
+t_data = t_all[spin_idx:] - T_SPIN
+NT = U_true.shape[0]
 
-    Parameters
-    ----------
-    U_snap : (T, N_x) real snapshots
-    UH_snap : (T, N_x//2+1) complex Fourier coefficients
-
-    Returns
-    -------
-    Theta : (T*N_x, 6)
-    """
-    T, Nx = U_snap.shape
-    all_theta = []
-    for t in range(T):
-        u = U_snap[t]
-        uh = UH_snap[t]
-        u_x    = np.fft.irfft(1j * k * uh, n=N_X)
-        u_xx   = np.fft.irfft(-k**2 * uh, n=N_X)
-        u_xxxx = np.fft.irfft(k**4 * uh, n=N_X)
-        theta = np.column_stack([
-            u, u_x, u_xx, u_xxxx,
-            u * u_x, u * u_xx,
-        ])
-        all_theta.append(theta)
-    return np.vstack(all_theta)
-
-
-def build_ks_library_single(u: np.ndarray) -> np.ndarray:
-    """Build features for a single snapshot (for rollout).
-
-    Uses spectral derivatives computed from FFT of the real-space field.
-    """
-    uh = np.fft.rfft(u)
-    u_x    = np.fft.irfft(1j * k * uh, n=N_X)
-    u_xx   = np.fft.irfft(-k**2 * uh, n=N_X)
-    u_xxxx = np.fft.irfft(k**4 * uh, n=N_X)
-    return np.column_stack([
-        u, u_x, u_xx, u_xxxx,
-        u * u_x, u * u_xx,
-    ])
-
-
-# Build dataset: each (space, time) cell is one training sample
-# Compute u_t via central differences in time (trim boundary)
-U_inner  = U[1:-1]        # (T-2, N_x)
-UH_inner = UH[1:-1]       # (T-2, N_x//2+1)
-U_dot_time = (U[2:] - U[:-2]) / (2 * DT)   # (T-2, N_x) — time derivative
-
-T_inner = U_inner.shape[0]
-print(f"[DATA]  Building spectral feature library for {T_inner}×{N_X} = "
-      f"{T_inner * N_X} samples ...")
-
-Theta   = build_ks_library(U_inner, UH_inner)  # (T_inner * N_x, 6)
-U_t_flat = U_dot_time.ravel()[:, None]          # (T_inner * N_x, 1)
-
-print(f"[DATA]  Theta shape: {Theta.shape}, U_t shape: {U_t_flat.shape}")
-
-# Subsample for PyKAN (LBFGS + grid updates struggle with >100K samples)
-MAX_SAMPLES = 100_000
-if len(Theta) > MAX_SAMPLES:
-    rng = np.random.default_rng(SEED)
-    idx = rng.choice(len(Theta), MAX_SAMPLES, replace=False)
-    Theta    = Theta[idx]
-    U_t_flat = U_t_flat[idx]
-    print(f"[DATA]  Subsampled to {MAX_SAMPLES}")
+print(f"[DATA]  Nt={NT}, Nx={NX}")
 
 # ---------------------------------------------------------------------------
-# 4. KANDy model  (single-layer KAN: width=[6, 1])
+# 4. Training data: all snapshots, forward-difference time derivatives
 # ---------------------------------------------------------------------------
-ks_lift = CustomLift(fn=lambda X: X, output_dim=N_FEATURES, name="ks_identity")
+t_train = np.arange(0.0, T_TRAIN + DT, DT).astype(np.float32)
+train_indices = [int(round(tt / DT)) for tt in t_train]
 
-model = KANDy(
-    lift=ks_lift,
-    grid=7,
-    k=3,
+X_snap = torch.tensor(U_true[train_indices], dtype=torch.float32, device=device)
+t_snap = torch.tensor(t_train, dtype=torch.float32, device=device)
+
+dt_seg = (t_snap[1:] - t_snap[:-1]).unsqueeze(1)
+U_k = X_snap[:-1]
+Ut_k = (X_snap[1:] - X_snap[:-1]) / dt_seg
+
+U_k_np = U_k.numpy()
+Ut_k_np = Ut_k.numpy()
+
+# Spatial derivatives via FD matrices
+ux_np = U_k_np @ Dx_mat.T
+uxx_np = U_k_np @ Dxx_mat.T
+uxxxx_np = U_k_np @ Dxxxx_mat.T
+
+# ---------------------------------------------------------------------------
+# 5. Feature library: 12 features per spatial point
+# ---------------------------------------------------------------------------
+FEATURE_NAMES = [
+    "u", "u_x", "u_xx", "u_xxxx",
+    "u^2", "u^3",
+    "u_x^2", "u_xx^2",
+    "u*u_x", "u*u_xx", "u*u_xxxx", "u_x*u_xx",
+]
+N_FEATURES = 12
+
+
+def build_library_features(u, ux, uxx, uxxxx):
+    feats = [u, ux, uxx, uxxxx]
+    feats += [u**2, u**3]
+    feats += [ux**2, uxx**2]
+    feats += [u * ux, u * uxx, u * uxxxx, ux * uxx]
+    Theta = np.stack(feats, axis=-1)          # (Nt, Nx, F)
+    return Theta.reshape(-1, Theta.shape[-1])  # (Nt*Nx, F)
+
+
+Theta_np = build_library_features(U_k_np, ux_np, uxx_np, uxxxx_np)
+y_np = Ut_k_np.reshape(-1, 1)
+
+X = torch.tensor(Theta_np, dtype=torch.float32, device=device)
+y = torch.tensor(y_np, dtype=torch.float32, device=device)
+
+# Normalize features
+X_mean = X.mean(dim=0, keepdim=True)
+X_std = X.std(dim=0, keepdim=True) + 1e-8
+Xn = (X - X_mean) / X_std
+
+# Random train/test split
+N_total = Xn.shape[0]
+perm = torch.randperm(N_total, device=device)
+N_test = max(1, int(0.2 * N_total))
+test_idx = perm[:N_test]
+train_idx = perm[N_test:]
+
+dataset = {
+    "train_input": Xn[train_idx],
+    "train_label": y[train_idx],
+    "test_input": Xn[test_idx],
+    "test_label": y[test_idx],
+}
+
+print(f"[DATA]  Features: {N_FEATURES}, train: {len(train_idx)}, test: {N_test}")
+
+# ---------------------------------------------------------------------------
+# 6. Rollout windows for integration loss
+# ---------------------------------------------------------------------------
+ROLLOUT_HORIZON = 1
+
+Dx_t = torch.tensor(Dx_mat, dtype=torch.float32, device=device)
+Dxx_t = torch.tensor(Dxx_mat, dtype=torch.float32, device=device)
+Dxxxx_t = torch.tensor(Dxxxx_mat, dtype=torch.float32, device=device)
+
+U_series = torch.tensor(U_true, dtype=torch.float32, device=device)
+t_series = torch.tensor(t_data, dtype=torch.float32, device=device)
+
+
+def sample_windows(U, T, H, n_windows, seed=0):
+    g = torch.Generator(device=U.device)
+    g.manual_seed(seed)
+    max_start = U.shape[0] - (H + 1)
+    starts = torch.randint(0, max_start + 1, (n_windows,), generator=g, device=U.device)
+    trj_u = torch.stack([U[s:s + H + 1] for s in starts], dim=0)
+    trj_t = torch.stack([T[s:s + H + 1] for s in starts], dim=0)
+    return trj_u, trj_t
+
+
+train_u_trj, train_t_trj = sample_windows(U_series, t_series, ROLLOUT_HORIZON, 128, seed=1)
+dataset["train_traj"] = train_u_trj
+dataset["train_t"] = train_t_trj
+
+# ---------------------------------------------------------------------------
+# 7. KAN model and dynamics function
+# ---------------------------------------------------------------------------
+rbf = lambda x: torch.exp(-(x**2))
+kan_pde = KAN(width=[N_FEATURES, 1], grid=10, k=5, base_fun=rbf, seed=SEED)
+
+
+def dynamics_fn(state):
+    """KS dynamics: state (B, Nx) -> u_t (B, Nx) via library + KAN."""
+    if state.dim() == 1:
+        state = state.unsqueeze(0)
+
+    u = state
+    ux = u @ Dx_t.T
+    uxx = u @ Dxx_t.T
+    uxxxx = u @ Dxxxx_t.T
+
+    feats = [u, ux, uxx, uxxxx, u**2, u**3,
+             ux**2, uxx**2, u * ux, u * uxx, u * uxxxx, ux * uxx]
+    Theta = torch.stack(feats, dim=-1)  # (B, Nx, F)
+    B, Nx_local, F = Theta.shape
+    Theta = Theta.reshape(B * Nx_local, F)
+    Theta_n = (Theta - X_mean) / X_std
+
+    ut = kan_pde(Theta_n)
+    if ut.dim() == 2 and ut.shape[1] == 1:
+        ut = ut[:, 0]
+    return ut.reshape(B, Nx_local)
+
+
+# ---------------------------------------------------------------------------
+# 8. Train with rollout loss
+# ---------------------------------------------------------------------------
+print("\n[TRAIN] Training KAN with rollout loss ...")
+results = fit_kan(
+    kan_pde,
+    dataset,
     steps=100,
-    seed=SEED,
-)
-
-model.fit(
-    X=Theta,
-    X_dot=U_t_flat,
-    val_frac=0.15,
-    test_frac=0.15,
+    lr=1e-3,
     lamb=0.0,
+    rollout_weight=0.9,
+    rollout_horizon=ROLLOUT_HORIZON,
+    dynamics_fn=dynamics_fn,
+    integrator="rk4",
+    stop_grid_update_step=200,
     patience=0,
-    verbose=True,
 )
 
 # ---------------------------------------------------------------------------
-# 5. Symbolic extraction
+# 9. Symbolic extraction (robust_auto_symbolic approach)
 # ---------------------------------------------------------------------------
 print("\n[SYMBOLIC] Extracting formula for u_t ...")
-import sympy as sp
-sym_subset = torch.tensor(Theta[:2048], dtype=torch.float32)
-model.model_.save_act = True
+kan_pde.save_act = True
 with torch.no_grad():
-    model.model_(sym_subset)
-model.model_.auto_symbolic()
-exprs, vars_ = model.model_.symbolic_formula()
-sub_map = {sp.Symbol(str(v)): sp.Symbol(n) for v, n in zip(vars_, FEATURE_NAMES)}
-formulas = []
-for expr_str in exprs:
-    sym = sp.sympify(expr_str).xreplace(sub_map)
-    sym = sp.expand(sym).xreplace(
-        {n: round(float(n), 4) for n in sym.atoms(sp.Number)}
-    )
-    formulas.append(sym)
-print(f"  u_t = {formulas[0]}")
-print(f"  [TRUE] u_t = -u*u_x - u_xx - u_xxxx")
+    _ = kan_pde(dataset["train_input"][:2000])
+
+kan_pde.auto_symbolic(lib=["x", "x^2", "x^3", "0"], weight_simple=0.1)
+exprs_raw, vars_ = kan_pde.symbolic_formula()
+
+u_sym, u_x_sym, u_xx_sym, u_xxxx_sym = sp.symbols("u u_x u_xx u_xxxx")
+feature_syms = [
+    u_sym, u_x_sym, u_xx_sym, u_xxxx_sym,
+    u_sym**2, u_sym**3,
+    u_x_sym**2, u_xx_sym**2,
+    u_sym * u_x_sym, u_sym * u_xx_sym, u_sym * u_xxxx_sym, u_x_sym * u_xx_sym,
+]
+
+sub_map = {vars_[i]: feature_syms[i] for i in range(min(len(vars_), len(feature_syms)))}
+
+
+def flatten(obj):
+    if isinstance(obj, (list, tuple)):
+        out = []
+        for it in obj:
+            out.extend(flatten(it))
+        return out
+    return [obj]
+
+
+def round_numbers(expr, places=3):
+    return expr.xreplace({a: sp.Float(round(float(a), places))
+                          for a in expr.atoms(sp.Number)})
+
+
+cleaned = []
+for expr in flatten(exprs_raw):
+    if not hasattr(expr, "free_symbols"):
+        continue
+    expr_sub = expr.subs(sub_map)
+    expr_sub = sp.together(sp.expand(expr_sub))
+    expr_sub = round_numbers(expr_sub, 3)
+    cleaned.append(expr_sub)
+
+for ex in cleaned:
+    print(f"  u_t = {ex}")
+print(f"\n  [TRUE] u_t = -u*u_x - u_xx - u_xxxx")
 
 # ---------------------------------------------------------------------------
-# 6. Evaluate point-wise MSE on test samples
+# 10. Evaluation — pointwise MSE
 # ---------------------------------------------------------------------------
-N_total    = len(Theta)
-n_test     = int(N_total * 0.15)
-Theta_test = Theta[N_total - n_test:]
-U_t_test   = U_t_flat[N_total - n_test:]
-
-U_t_pred   = model.predict(Theta_test)
-mse = np.mean((U_t_pred - U_t_test) ** 2)
-print(f"\n[EVAL]  Test MSE (point-wise): {mse:.6e}")
-print(f"[EVAL]  Test RMSE:             {mse**0.5:.6e}")
+with torch.no_grad():
+    yhat = kan_pde(Xn).cpu().numpy().reshape(-1)
+    ytrue = y.cpu().numpy().reshape(-1)
+mse = np.mean((yhat - ytrue)**2)
+print(f"\n[EVAL]  Overall MSE: {mse:.6e}")
 
 # ---------------------------------------------------------------------------
-# 7. Rollout: integrate the learned model in time on held-out snapshots
+# 11. Rollout using RK4 with substeps
 # ---------------------------------------------------------------------------
-def rollout_ks(model, u0: np.ndarray, n_steps: int) -> np.ndarray:
-    """ETDRK4 rollout using the learned KANDy model.
+n_sub = 10
+h_sub = DT / n_sub
 
-    The stiff linear part (u_xx + u_xxxx) is handled exactly via the same
-    ETDRK4 coefficients used for data generation.  The "nonlinear" part is
-    whatever the learned model predicts minus the known linear contribution:
-        N_learned(u) = KANDy(phi(u)) - linear(u)
-    """
-    u_hat = np.fft.rfft(u0)
-    traj  = [u0.copy()]
+print("[EVAL]  Running rollout ...")
+kan_pde.eval()
+U_kan = np.zeros_like(U_true, dtype=np.float64)
+U_kan[0] = U_true[0]
 
-    for _ in range(n_steps - 1):
-        def learned_nl(v_hat):
-            v = np.fft.irfft(v_hat, n=N_X)
-            theta = build_ks_library_single(v)   # (N_x, 6)
-            u_t_full = model.predict(theta).ravel()
-            # Subtract the linear part so ETDRK4 handles it implicitly
-            v_xx   = np.fft.irfft(-(k ** 2) * v_hat, n=N_X)
-            v_xxxx = np.fft.irfft((k ** 4) * v_hat, n=N_X)
-            nl_phys = u_t_full - (-v_xx - v_xxxx)   # total - linear = nonlinear
-            return np.fft.rfft(nl_phys)
+state = torch.tensor(U_true[0], dtype=torch.float32, device=device).unsqueeze(0)
 
-        Nu = learned_nl(u_hat)
-        a  = E2 * u_hat + Q * Nu
-        Na = learned_nl(a)
-        b  = E2 * u_hat + Q * Na
-        Nb = learned_nl(b)
-        c  = E2 * a + Q * (2 * Nb - Nu)
-        Nc = learned_nl(c)
-        u_hat = E * u_hat + Nu * f1 + 2 * (Na + Nb) * f2 + Nc * f3
+with torch.no_grad():
+    for step in range(1, NT):
+        for _ in range(n_sub):
+            k1 = dynamics_fn(state)
+            k2 = dynamics_fn(state + 0.5 * h_sub * k1)
+            k3 = dynamics_fn(state + 0.5 * h_sub * k2)
+            k4 = dynamics_fn(state + h_sub * k3)
+            state = state + (h_sub / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+        U_kan[step] = state.squeeze(0).numpy()
+        if np.any(np.isnan(U_kan[step])) or np.abs(U_kan[step]).max() > 1e3:
+            print(f"  Blowup at step {step}, stopping rollout")
+            U_kan[step:] = np.nan
+            break
 
-        traj.append(np.fft.irfft(u_hat, n=N_X).real.copy())
-
-    return np.array(traj)
-
-
-N_ROLLOUT = 200
-u0_rollout  = U_inner[int(T_inner * 0.80)]     # start from test region
-true_rollout = U_inner[int(T_inner * 0.80): int(T_inner * 0.80) + N_ROLLOUT]
-pred_rollout = rollout_ks(model, u0_rollout, N_ROLLOUT)
-
-rmse_rollout = np.sqrt(np.mean((pred_rollout - true_rollout) ** 2))
-print(f"[EVAL]  Rollout RMSE (T={N_ROLLOUT} steps, dt={DT}): {rmse_rollout:.6f}")
+N_valid = np.sum(~np.isnan(U_kan[:, 0]))
+if N_valid > 1:
+    rmse = np.sqrt(np.nanmean((U_kan[:N_valid] - U_true[:N_valid])**2))
+    print(f"[EVAL]  Rollout RMSE ({N_valid} valid steps): {rmse:.6f}")
 
 # ---------------------------------------------------------------------------
-# 8. Figures
+# 12. Figures
 # ---------------------------------------------------------------------------
 use_pub_style()
 os.makedirs("results/KS", exist_ok=True)
 
-# 8a. Space-time heatmap comparison
+# 12a. Space-time heatmaps
+N_plot = min(N_valid, NT)
+t_plot = t_data[:N_plot]
 fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-t_arr = np.arange(N_ROLLOUT) * DT
-for ax, data, title in zip(axes,
-                             [true_rollout, pred_rollout],
-                             ["True KS", "KANDy"]):
+for ax, data, title in zip(axes, [U_true[:N_plot], U_kan[:N_plot]], ["True KS", "KANDy"]):
     im = ax.imshow(data.T, origin="lower", aspect="auto",
-                   extent=[0, t_arr[-1], 0, L],
+                   extent=[t_plot[0], t_plot[-1], 0, L],
                    cmap="RdBu_r", vmin=-3, vmax=3)
-    ax.set_xlabel("time t"); ax.set_ylabel("x")
+    ax.set_xlabel("t")
+    ax.set_ylabel("x")
     ax.set_title(title)
 fig.colorbar(im, ax=axes, label="u(x,t)")
-fig.suptitle("Kuramoto–Sivashinsky", fontsize=12)
 fig.tight_layout()
 fig.savefig("results/KS/spacetime.png", dpi=300, bbox_inches="tight")
 fig.savefig("results/KS/spacetime.pdf", dpi=300, bbox_inches="tight")
 plt.close(fig)
 
-# 8b. Loss curves
-if hasattr(model, "train_results_") and model.train_results_ is not None:
-    fig, ax = plot_loss_curves(
-        model.train_results_,
-        save="results/KS/loss_curves",
-    )
-    plt.close(fig)
-
-# 8c. Edge activations (subsample training data for speed)
-n_sub = min(5000, int(N_total * 0.70))
-sub_idx = np.random.choice(int(N_total * 0.70), n_sub, replace=False)
-train_theta_t = torch.tensor(Theta[sub_idx], dtype=torch.float32)
+# 12b. Edge activations
+n_sub_plot = min(5000, len(train_idx))
+sub_theta = Xn[train_idx[:n_sub_plot]]
 fig, axes = plot_all_edges(
-    model.model_,
-    X=train_theta_t,
+    kan_pde,
+    X=sub_theta,
     in_var_names=FEATURE_NAMES,
     out_var_names=["u_t"],
     save="results/KS/edge_activations",
 )
 plt.close(fig)
 
-print("[FIGS]  Saved results/KS/")
+# 12c. Loss curves
+if results:
+    fig, ax = plot_loss_curves(
+        results,
+        save="results/KS/loss_curves",
+    )
+    plt.close(fig)
+
+print(f"[FIGS]  Saved results/KS/")

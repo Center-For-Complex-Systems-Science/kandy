@@ -1,4 +1,0 @@
-### Round 0 ###
-init => 0.0
-0.0 => fit_kan => 0.1
-0.1 => auto_symbolic => 0.2

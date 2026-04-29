@@ -24,11 +24,8 @@ _SYSTEMS = {
     "burgers":              "burgers_example",
     "burgers-fourier":      "burgers_fourier_example",
     "kuramoto-sivashinsky": "kuramoto_sivashinsky_example",
-    "navier-stokes":        "navier_stokes_example",
     "hopf":                 "hopf_example",
     "ikeda":                "ikeda_example",
-    "holling":              "holling_type_ii_example",
-    "adaptive-kuramoto":    "adaptive_kuramoto_example",
 }
 
 _BASELINES = {
@@ -38,18 +35,10 @@ _BASELINES = {
 }
 
 
-def run():
-    """Run a KANDy experiment by system name."""
-    if len(sys.argv) < 2 or sys.argv[1] in ("--list", "-l"):
-        print("Available systems:")
-        for name in sorted(_SYSTEMS):
-            print(f"  {name}")
-        return
-
-    system = sys.argv[1].lower()
-    if system not in _SYSTEMS:
-        print(f"Unknown system '{system}'. Use --list to see options.")
-        sys.exit(1)
+def _run_one(system: str):
+    """Run a single system by name."""
+    import runpy
+    import os
 
     module_name = _SYSTEMS[system]
     script = _EXAMPLES_DIR / f"{module_name}.py"
@@ -57,12 +46,36 @@ def run():
         print(f"Script not found: {script}")
         sys.exit(1)
 
-    print(f"Running: {script}")
-    # Execute in the repo root so results/ paths work
-    import runpy
-    import os
+    print(f"\n{'='*60}")
+    print(f"  Running: {system}")
+    print(f"{'='*60}")
     os.chdir(script.parent.parent)
     runpy.run_path(str(script), run_name="__main__")
+
+
+def run():
+    """Run a KANDy experiment by system name."""
+    if len(sys.argv) < 2 or sys.argv[1] in ("--list", "-l"):
+        print("Available systems:")
+        for name in sorted(_SYSTEMS):
+            print(f"  {name}")
+        print("\nUse --all to run every system.")
+        return
+
+    if sys.argv[1] in ("--all", "-a"):
+        for system in _SYSTEMS:
+            _run_one(system)
+        print(f"\n{'='*60}")
+        print(f"  All {len(_SYSTEMS)} systems complete.")
+        print(f"{'='*60}")
+        return
+
+    system = sys.argv[1].lower()
+    if system not in _SYSTEMS:
+        print(f"Unknown system '{system}'. Use --list to see options.")
+        sys.exit(1)
+
+    _run_one(system)
 
 
 def run_baselines():

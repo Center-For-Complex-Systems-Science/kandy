@@ -20,11 +20,9 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from scipy.integrate import solve_ivp
 
 from kandy import KANDy, CustomLift
 from kandy.plotting import (
-    get_all_edge_activations,
     plot_all_edges,
     plot_attractor_overlay,
     plot_trajectory_error,
@@ -35,46 +33,61 @@ from kandy.plotting import (
 # ---------------------------------------------------------------------------
 # 0. Reproducibility
 # ---------------------------------------------------------------------------
-SEED = 42
+SEED = 0
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 # ---------------------------------------------------------------------------
-# 1. Data generation — Lorenz ODE
+# 1. Data generation — Lorenz ODE (RK4)
 # ---------------------------------------------------------------------------
 SIGMA = 10.0
 RHO   = 28.0
 BETA  = 8.0 / 3.0
 
 
-def lorenz(t, state):
+def lorenz_rhs(state):
     x, y, z = state
-    return [
+    return np.array([
         SIGMA * (y - x),
         x * (RHO - z) - y,
         x * y - BETA * z,
-    ]
+    ])
 
 
-DT    = 0.01
-T_MAX = 30.0          # 30 seconds of simulation
-BURN  = 5.0           # seconds of transient to discard
+def rk4_step(f, y, dt):
+    k1 = f(y)
+    k2 = f(y + 0.5 * dt * k1)
+    k3 = f(y + 0.5 * dt * k2)
+    k4 = f(y + dt * k3)
+    return y + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
 
-t_full = np.arange(0.0, T_MAX + BURN, DT)
-sol    = solve_ivp(lorenz, [t_full[0], t_full[-1]], [1.0, 1.0, 1.0],
-                   t_eval=t_full, method="RK45", rtol=1e-10, atol=1e-12)
+
+DT      = 0.005
+T_MAX   = 50.0
+BURN_IN = 2.0
+
+n_steps = int(np.round(T_MAX / DT))
+t_fine  = np.linspace(0.0, T_MAX, n_steps + 1)
+
+traj = np.zeros((n_steps + 1, 3))
+traj[0] = [1.0, 1.0, 1.0]
+for i in range(n_steps):
+    traj[i + 1] = rk4_step(lorenz_rhs, traj[i], DT)
 
 # Discard transient
-n_burn = int(BURN / DT)
-X      = sol.y[:, n_burn:].T          # (N, 3)
-t_data = t_full[n_burn:]
+burn_idx = int(np.floor(BURN_IN / DT))
+t_data = t_fine[burn_idx:]
+X      = traj[burn_idx:]          # (N, 3)
 
-# Analytical derivatives (use the ODE directly — cleaner than finite diff)
-X_dot = np.column_stack([
-    SIGMA * (X[:, 1] - X[:, 0]),
-    X[:, 0] * (RHO - X[:, 2]) - X[:, 1],
-    X[:, 0] * X[:, 1] - BETA * X[:, 2],
-])
+# Forward-difference derivatives (same as research code)
+X_dot = (X[1:] - X[:-1]) / DT    # (N-1, 3)
+X     = X[:-1]
+t_data = t_data[:-1]
 
 print(f"[DATA]  N={len(X)} snapshots, dt={DT}")
 
@@ -91,25 +104,42 @@ def lorenz_lift(X: np.ndarray) -> np.ndarray:
     return np.column_stack([x, y, z, x * y, x * z, y * z])
 
 
-lift = CustomLift(fn=lorenz_lift, output_dim=6, name="lorenz_lift")
+def lorenz_lift_torch(X: torch.Tensor) -> torch.Tensor:
+    """Torch version of lift (differentiable, for rollout loss)."""
+    x, y, z = X[:, 0], X[:, 1], X[:, 2]
+    return torch.stack([x, y, z, x * y, x * z, y * z], dim=1)
+
+
+lift = CustomLift(fn=lorenz_lift, output_dim=6, torch_fn=lorenz_lift_torch, name="lorenz_lift")
 
 # ---------------------------------------------------------------------------
 # 3. KANDy model  (single-layer KAN: width=[6, 3])
+#    Matches research code: grid=2, k=1, RBF base, rollout loss
 # ---------------------------------------------------------------------------
+rbf = lambda x: torch.exp(-(3 * x**2))
+
 model = KANDy(
     lift=lift,
-    grid=5,
-    k=3,
-    steps=500,
+    grid=2,
+    k=1,
+    steps=300,
     seed=SEED,
+    base_fun=rbf,
 )
 
 model.fit(
     X=X,
     X_dot=X_dot,
-    val_frac=0.15,
-    test_frac=0.15,
+    dt=DT,
+    val_frac=0.0,
+    test_frac=0.2,
     lamb=0.0,
+    opt="LBFGS",
+    lr=1e-3,
+    rollout_weight=1.0,
+    rollout_horizon=10,
+    stop_grid_update_step=300,
+    patience=0,
 )
 
 # ---------------------------------------------------------------------------
@@ -145,13 +175,12 @@ print(f"\n[EVAL]  Rollout RMSE (T={T_test} steps): {rmse:.6f}")
 use_pub_style()
 os.makedirs("results/Lorenz", exist_ok=True)
 
-# 6a. Attractor overlay (x–z projection)
+# 6a. Attractor overlay (x-z projection)
 fig, ax = plot_attractor_overlay(
     true_traj, pred_traj,
     dim_x=0, dim_y=2,
     labels=["True Lorenz", "KANDy"],
     colors=["#1f77b4", "#d62728"],
-    title="Lorenz Attractor",
     save="results/Lorenz/attractor",
 )
 plt.close(fig)
@@ -160,7 +189,6 @@ plt.close(fig)
 t_test = np.arange(T_test) * DT
 fig, ax = plot_trajectory_error(
     true_traj, pred_traj, t=t_test,
-    title="Lorenz trajectory error",
     save="results/Lorenz/trajectory_error",
 )
 plt.close(fig)
@@ -169,7 +197,6 @@ plt.close(fig)
 if hasattr(model, "train_results_") and model.train_results_ is not None:
     fig, ax = plot_loss_curves(
         model.train_results_,
-        title="Lorenz training loss",
         save="results/Lorenz/loss_curves",
     )
     plt.close(fig)
@@ -178,13 +205,11 @@ if hasattr(model, "train_results_") and model.train_results_ is not None:
 train_theta = torch.tensor(
     lorenz_lift(X[: int(N * 0.70)]), dtype=torch.float32
 )
-activations = get_all_edge_activations(model.model_, X=train_theta)
-fig = plot_all_edges(
+fig, axes = plot_all_edges(
     model.model_,
     X=train_theta,
-    input_names=FEATURE_NAMES,
-    output_names=["x_dot", "y_dot", "z_dot"],
-    title="Lorenz KAN edge activations",
+    in_var_names=FEATURE_NAMES,
+    out_var_names=["x_dot", "y_dot", "z_dot"],
     save="results/Lorenz/edge_activations",
 )
 plt.close(fig)

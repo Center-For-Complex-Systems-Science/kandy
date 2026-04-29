@@ -22,7 +22,6 @@ Use the **model-quality-assessor** agent to:
    - **ODEs** (Lorenz, Hopf): trajectory tracking, attractor geometry, divergence time
    - **PDEs** (Burgers, KS): space-time rollout accuracy, shock locations, spectral content
    - **Maps** (Henon, Ikeda): attractor structure, iterate accuracy
-   - **Coupled** (Kuramoto): order parameter tracking, phase synchronization
 4. Check for common failure modes (blowup, phase drift, amplitude mismatch, overfitting)
 5. Rate overall quality: Excellent / Good / Fair / Poor
 6. Provide specific recommendations for improvement if needed

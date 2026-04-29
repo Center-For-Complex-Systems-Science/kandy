@@ -63,7 +63,7 @@ DEVICE = torch.device("cpu")   # PyKAN has CUDA grid-update bugs; force CPU
 U        = 0.9     # dissipation parameter (chaos at u ≥ 0.83)
 N_TOTAL  = 12_000
 BURN_IN  = 2_000
-HORIZON  = 15      # rollout horizon for training loss (discrete steps)
+HORIZON  = 1       # rollout horizon for training loss (discrete steps)
 
 # ---------------------------------------------------------------------------
 # 1. Data generation — Ikeda map iteration
@@ -192,7 +192,7 @@ def discrete_rhs(state_xy: torch.Tensor) -> torch.Tensor:
 
 
 # Windowed trajectory data for the rollout loss in fit_kan
-window = HORIZON + 1
+window = 1 + 15  # horizon 15 => length 16 (matching research code window size)
 train_seq = torch.tensor(series[: n_train + 1], dtype=torch.float32, device=DEVICE)
 test_seq  = torch.tensor(series[n_train + n_val : n_train + n_val + 2000],
                          dtype=torch.float32, device=DEVICE)
@@ -227,7 +227,8 @@ model.fit(
     test_frac=float(n_test) / N,
     lamb=0.0,
     opt="LBFGS",
-    fit_steps=200,
+    fit_steps=50,
+    patience=0,
 )
 
 # Phase 2: fine-tune with rollout loss using the discrete_rhs trick
@@ -251,15 +252,16 @@ rollout_results = fit_kan(
     dataset_roll,
     opt="LBFGS",
     steps=100,
-    lr=1e-2,
-    batch=-1,                    # full batch for LBFGS
-    rollout_weight=0.2,          # gentle rollout correction
+    lr=1e-4,
+    batch=2048,
+    rollout_weight=0.6,
     rollout_horizon=HORIZON,
     traj_batch=512,
     dynamics_fn=discrete_rhs,
     integrator="euler",          # Euler + discrete_rhs = exact map iteration
     update_grid=True,
     stop_grid_update_step=2000,
+    patience=0,
 )
 
 # ---------------------------------------------------------------------------

@@ -110,14 +110,17 @@ class KANDy:
         X_dot: Optional[np.ndarray] = None,
         *,
         dt: Optional[float] = None,
+        t: Optional[np.ndarray] = None,
         val_frac: float = 0.15,
         test_frac: float = 0.15,
         lamb: float = 0.0,
         rollout_weight: float = 0.0,
+        rollout_horizon: Optional[int] = None,
         rollout_loss_fn: Optional[Callable] = None,
         opt: str = "LBFGS",
         lr: float = 1.0,
         batch: int = -1,
+        stop_grid_update_step: int = 50,
         fit_steps: Optional[int] = None,
         patience: int = 10,
         verbose: bool = True,
@@ -129,10 +132,15 @@ class KANDy:
         X : np.ndarray, shape (N, n)
             State trajectory.  Rows are time snapshots.
         X_dot : np.ndarray, shape (N, n), optional
-            Time derivatives.  If omitted ``dt`` must be given and central
-            differences are used (which trims two boundary points from X).
+            Time derivatives.  If omitted ``dt`` must be given and forward
+            differences are used.
         dt : float, optional
-            Uniform time step for central-difference derivative estimation.
+            Uniform time step — used for forward-difference derivative
+            estimation (when X_dot is omitted) and for building trajectory
+            data for rollout loss.
+        t : np.ndarray, shape (N,), optional
+            Time values for each snapshot.  If not provided but ``dt`` is,
+            a uniform grid is constructed automatically.
         val_frac, test_frac : float
             Chronological train / val / test split fractions.
         lamb : float
@@ -140,6 +148,9 @@ class KANDy:
         rollout_weight : float
             Weight on the integrated trajectory loss (default 0 = derivative
             supervision only).
+        rollout_horizon : int, optional
+            Number of integration steps per trajectory segment for the rollout
+            loss.  None = use full trajectory length minus 1.
         opt : str
             Optimiser: ``'LBFGS'`` (default) or ``'Adam'``.
             Use ``'Adam'`` for large datasets or when training discrete maps
@@ -148,6 +159,8 @@ class KANDy:
             Learning rate (default 1.0 for LBFGS; use ~1e-3 for Adam).
         batch : int
             Mini-batch size (-1 = full batch, default).
+        stop_grid_update_step : int
+            Step at which KAN grid updates stop (default 50).
         rollout_loss_fn : callable, optional
             Loss function used for the rollout loss only.  If ``None``
             (default), falls back to MSE — the same as the derivative loss.
@@ -171,12 +184,12 @@ class KANDy:
         self._set_seeds()
         steps = fit_steps if fit_steps is not None else self.steps
 
-        # Derivative estimation via central differences if X_dot not provided
+        # Derivative estimation via forward differences if X_dot not provided
         if X_dot is None:
             if dt is None:
-                raise ValueError("Provide X_dot or dt (for central-difference estimation).")
-            X_dot = self._central_diff(X, dt)
-            X = X[1:-1]
+                raise ValueError("Provide X_dot or dt (for forward-difference estimation).")
+            X_dot = (X[1:] - X[:-1]) / dt
+            X = X[:-1]
 
         X = np.asarray(X, dtype=np.float64)
         X_dot = np.asarray(X_dot, dtype=np.float64)
@@ -217,6 +230,20 @@ class KANDy:
             "test_label":  _t(X_dot[n2:]),
         }
 
+        # Pack trajectory data for rollout loss
+        if rollout_weight > 0.0:
+            if t is None and dt is not None:
+                t = np.arange(N) * dt
+            if t is not None:
+                train_traj = torch.tensor(
+                    X[:n1][None, :, :], dtype=torch.float32, device=self.device
+                )
+                train_t = torch.tensor(
+                    t[:n1], dtype=torch.float32, device=self.device
+                )
+                dataset["train_traj"] = train_traj
+                dataset["train_t"] = train_t
+
         if verbose:
             print(
                 f"[KANDy] Split — train: {n1}, val: {n2-n1}, test: {N-n2}  "
@@ -235,6 +262,23 @@ class KANDy:
 
         self.model_ = KAN(**kan_kwargs)
 
+        # Build dynamics_fn that applies the lift before the KAN
+        # (trajectories are in raw state space but the KAN expects lifted features)
+        _lift = self.lift
+        _model = self.model_
+
+        def _dynamics_fn(state: torch.Tensor) -> torch.Tensor:
+            # Use torch_fn if available (preserves gradient graph)
+            if hasattr(_lift, "torch_fn") and _lift.torch_fn is not None:
+                lifted_t = _lift.torch_fn(state)
+            else:
+                state_np = state.detach().cpu().numpy()
+                lifted = _lift(state_np)
+                lifted_t = torch.tensor(
+                    lifted, dtype=torch.float32, device=state.device
+                )
+            return _model(lifted_t)
+
         self.train_results_ = fit_kan(
             self.model_,
             dataset,
@@ -244,7 +288,10 @@ class KANDy:
             steps=steps,
             lamb=lamb,
             rollout_weight=rollout_weight,
+            rollout_horizon=rollout_horizon,
             rollout_loss_fn=rollout_loss_fn,
+            dynamics_fn=_dynamics_fn if rollout_weight > 0.0 else None,
+            stop_grid_update_step=stop_grid_update_step,
             patience=patience,
         )
 
@@ -290,6 +337,7 @@ class KANDy:
         var_names: Optional[list[str]] = None,
         round_places: int = 3,
         simplify: bool = False,
+        lib: Optional[list] = None,
     ) -> list:
         """Extract symbolic formulas via PyKAN's auto_symbolic.
 
@@ -308,6 +356,11 @@ class KANDy:
             If True, attempt SymPy simplification pipeline after extraction:
             ``sp.factor`` → ``sp.together`` → ``sp.nsimplify``.  Can be slow
             for large expressions (default False).
+        lib : list, optional
+            Symbolic function library for ``auto_symbolic``.  Each entry is
+            a string name (e.g. ``'x^2'``) or a tuple
+            ``(name, torch_fn, sympy_fn, complexity)``.
+            If None, uses PyKAN's default library.
 
         Returns
         -------
@@ -322,7 +375,10 @@ class KANDy:
         with torch.no_grad():
             self.model_(self._train_input)
 
-        self.model_.auto_symbolic()
+        auto_sym_kwargs = {}
+        if lib is not None:
+            auto_sym_kwargs["lib"] = lib
+        self.model_.auto_symbolic(**auto_sym_kwargs)
         exprs, inputs = self.model_.symbolic_formula()
 
         # Build variable substitution map

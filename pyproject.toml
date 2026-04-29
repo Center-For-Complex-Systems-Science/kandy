@@ -2,7 +2,7 @@
 name = "kandy"
 version = "0.1.0"
 description = "KANDy: Kolmogorov-Arnold Networks for Dynamics"
-authors = [{ name = "Your Name", email = "you@example.com" }]
+authors = [{ name = "Kevin Slote", email = "kslote@clarkson.edu" }]
 requires-python = ">=3.11,<3.14"
 dependencies = [
     # KANDy scientific stack
