@@ -26,7 +26,6 @@ Typical usage
 from __future__ import annotations
 
 import random
-import warnings
 from typing import Callable, Optional, Union
 
 import numpy as np
@@ -117,6 +116,8 @@ class KANDy:
         rollout_weight: float = 0.0,
         rollout_horizon: Optional[int] = None,
         rollout_loss_fn: Optional[Callable] = None,
+        dynamics_fn: Optional[Callable] = None,
+        dataset_extras: Optional[dict] = None,
         opt: str = "LBFGS",
         lr: float = 1.0,
         batch: int = -1,
@@ -230,8 +231,8 @@ class KANDy:
             "test_label":  _t(X_dot[n2:]),
         }
 
-        # Pack trajectory data for rollout loss
-        if rollout_weight > 0.0:
+        # Pack trajectory data for rollout loss (skip if user supplies extras)
+        if rollout_weight > 0.0 and dataset_extras is None:
             if t is None and dt is not None:
                 t = np.arange(N) * dt
             if t is not None:
@@ -243,6 +244,10 @@ class KANDy:
                 )
                 dataset["train_traj"] = train_traj
                 dataset["train_t"] = train_t
+
+        # Merge user-supplied dataset extras (e.g. pre-built trajectory windows)
+        if dataset_extras is not None:
+            dataset.update(dataset_extras)
 
         if verbose:
             print(
@@ -279,6 +284,11 @@ class KANDy:
                 )
             return _model(lifted_t)
 
+        # Use user-supplied dynamics_fn if provided, else the auto-built one
+        _dyn = dynamics_fn if dynamics_fn is not None else (
+            _dynamics_fn if rollout_weight > 0.0 else None
+        )
+
         self.train_results_ = fit_kan(
             self.model_,
             dataset,
@@ -290,7 +300,7 @@ class KANDy:
             rollout_weight=rollout_weight,
             rollout_horizon=rollout_horizon,
             rollout_loss_fn=rollout_loss_fn,
-            dynamics_fn=_dynamics_fn if rollout_weight > 0.0 else None,
+            dynamics_fn=_dyn,
             stop_grid_update_step=stop_grid_update_step,
             patience=patience,
         )
@@ -320,16 +330,8 @@ class KANDy:
         with torch.no_grad():
             # PyKAN stores per-edge spline scales in act_fun[0].scale_sp
             # shape: (n_out * n_in,) → reshape to (n_out, n_in) = (n, m)
-            try:
-                scale = self.model_.act_fun[0].scale_sp
-                A = scale.detach().cpu().numpy().reshape(self.state_dim_, self.lift_dim_)
-            except AttributeError:
-                warnings.warn(
-                    "Could not extract A from model.act_fun[0].scale_sp. "
-                    "PyKAN API may have changed.  Returning None.",
-                    stacklevel=2,
-                )
-                A = None
+            scale = self.model_.act_fun[0].scale_sp
+            A = scale.detach().cpu().numpy().reshape(self.state_dim_, self.lift_dim_)
         return A
 
     def get_formula(
@@ -338,11 +340,15 @@ class KANDy:
         round_places: int = 3,
         simplify: bool = False,
         lib: Optional[list] = None,
+        r2_threshold: float = 0.80,
+        weight_simple: float = 0.8,
     ) -> list:
-        """Extract symbolic formulas via PyKAN's auto_symbolic.
+        """Extract symbolic formulas via robust_auto_symbolic.
 
-        Calls ``model.auto_symbolic()`` then ``model.symbolic_formula()``
-        and returns one SymPy expression per output dimension.
+        Uses ``robust_auto_symbolic`` which collects the best symbolic
+        candidate for every edge, keeps only edges above ``r2_threshold``,
+        and zeros the rest.  Then calls ``model.symbolic_formula()`` and
+        returns one SymPy expression per output dimension.
 
         Parameters
         ----------
@@ -357,10 +363,16 @@ class KANDy:
             ``sp.factor`` → ``sp.together`` → ``sp.nsimplify``.  Can be slow
             for large expressions (default False).
         lib : list, optional
-            Symbolic function library for ``auto_symbolic``.  Each entry is
-            a string name (e.g. ``'x^2'``) or a tuple
-            ``(name, torch_fn, sympy_fn, complexity)``.
-            If None, uses PyKAN's default library.
+            Symbolic function library.  Each entry is a string name
+            (e.g. ``'x^2'``).  If None, defaults to
+            ``['x', 'x^2', 'x^3', '0']``.
+        r2_threshold : float
+            Minimum R² for an edge to be kept as symbolic.  Edges below
+            this threshold are zeroed (default 0.80).
+        weight_simple : float
+            Simplicity pressure for ``suggest_symbolic`` (default 0.8).
+            Lower values (e.g. 0.1) allow more complex fits like x²;
+            higher values prefer simpler functions (x or 0).
 
         Returns
         -------
@@ -368,6 +380,8 @@ class KANDy:
             One expression per output dimension, e.g.
             ``[x_dot_expr, y_dot_expr, z_dot_expr]`` for a 3D system.
         """
+        from .symbolic import robust_auto_symbolic
+
         self._check_fitted()
 
         # Populate activations with a forward pass on training data
@@ -375,10 +389,15 @@ class KANDy:
         with torch.no_grad():
             self.model_(self._train_input)
 
-        auto_sym_kwargs = {}
-        if lib is not None:
-            auto_sym_kwargs["lib"] = lib
-        self.model_.auto_symbolic(**auto_sym_kwargs)
+        if lib is None:
+            lib = ["x", "x^2", "x^3", "0"]
+
+        robust_auto_symbolic(
+            self.model_,
+            lib=lib,
+            r2_threshold=r2_threshold,
+            weight_simple=weight_simple,
+        )
         exprs, inputs = self.model_.symbolic_formula()
 
         # Build variable substitution map
@@ -573,8 +592,5 @@ def _simplify_pipeline(expr) -> sp.Expr:
     """Apply a cascade of SymPy simplifiers, returning the shortest result."""
     candidates = [expr]
     for fn in (sp.factor, sp.together, lambda e: sp.nsimplify(e, rational=False, tolerance=1e-3)):
-        try:
-            candidates.append(fn(expr))
-        except Exception:
-            pass
+        candidates.append(fn(expr))
     return min(candidates, key=lambda e: len(str(e)))

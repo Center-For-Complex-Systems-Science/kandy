@@ -102,7 +102,8 @@ print("\n[SYMBOLIC] Extracting formulas...")
 
 formulas = model.get_formula(
     var_names=["x_n", "y_n"],
-    lib=["x", "x^2", "x^3", "x^4", "0"],
+    lib=["x", "x^2", "0"],
+    weight_simple=0.5,
 )
 import sympy as sp
 x_sym, y_sym = sp.symbols("x_n y_n")

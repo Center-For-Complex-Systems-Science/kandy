@@ -26,10 +26,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
-from kan import KAN
 import sympy as sp
 
-from kandy.training import fit_kan
+from kandy import KANDy, CustomLift
 from kandy.plotting import (
     plot_all_edges,
     plot_loss_curves,
@@ -160,21 +159,10 @@ X_mean = X.mean(dim=0, keepdim=True)
 X_std = X.std(dim=0, keepdim=True) + 1e-8
 Xn = (X - X_mean) / X_std
 
-# Random train/test split
-N_total = Xn.shape[0]
-perm = torch.randperm(N_total, device=device)
-N_test = max(1, int(0.2 * N_total))
-test_idx = perm[:N_test]
-train_idx = perm[N_test:]
+Xn_np = Xn.numpy()
+y_np = y.numpy()
 
-dataset = {
-    "train_input": Xn[train_idx],
-    "train_label": y[train_idx],
-    "test_input": Xn[test_idx],
-    "test_label": y[test_idx],
-}
-
-print(f"[DATA]  Features: {N_FEATURES}, train: {len(train_idx)}, test: {N_test}")
+print(f"[DATA]  Features: {N_FEATURES}, samples: {len(Xn_np)}")
 
 # ---------------------------------------------------------------------------
 # 6. Rollout windows for integration loss
@@ -200,14 +188,14 @@ def sample_windows(U, T, H, n_windows, seed=0):
 
 
 train_u_trj, train_t_trj = sample_windows(U_series, t_series, ROLLOUT_HORIZON, 128, seed=1)
-dataset["train_traj"] = train_u_trj
-dataset["train_t"] = train_t_trj
 
 # ---------------------------------------------------------------------------
-# 7. KAN model and dynamics function
+# 7. KANDy model and PDE dynamics function
 # ---------------------------------------------------------------------------
 rbf = lambda x: torch.exp(-(x**2))
-kan_pde = KAN(width=[N_FEATURES, 1], grid=10, k=5, base_fun=rbf, seed=SEED)
+ks_lift = CustomLift(fn=lambda X: X, output_dim=N_FEATURES, name="ks_precomputed")
+
+model = KANDy(lift=ks_lift, grid=10, k=5, steps=100, seed=SEED, base_fun=rbf)
 
 
 def dynamics_fn(state):
@@ -227,26 +215,26 @@ def dynamics_fn(state):
     Theta = Theta.reshape(B * Nx_local, F)
     Theta_n = (Theta - X_mean) / X_std
 
-    ut = kan_pde(Theta_n)
+    ut = model.model_(Theta_n)
     if ut.dim() == 2 and ut.shape[1] == 1:
         ut = ut[:, 0]
     return ut.reshape(B, Nx_local)
 
 
 # ---------------------------------------------------------------------------
-# 8. Train with rollout loss
+# 8. Train via KANDy.fit() with custom dynamics and trajectory windows
 # ---------------------------------------------------------------------------
 print("\n[TRAIN] Training KAN with rollout loss ...")
-results = fit_kan(
-    kan_pde,
-    dataset,
-    steps=100,
+model.fit(
+    X=Xn_np,
+    X_dot=y_np,
+    val_frac=0.0,
+    test_frac=0.2,
     lr=1e-3,
-    lamb=0.0,
     rollout_weight=0.9,
     rollout_horizon=ROLLOUT_HORIZON,
     dynamics_fn=dynamics_fn,
-    integrator="rk4",
+    dataset_extras={"train_traj": train_u_trj, "train_t": train_t_trj},
     stop_grid_update_step=200,
     patience=0,
 )
@@ -255,9 +243,10 @@ results = fit_kan(
 # 9. Symbolic extraction (robust_auto_symbolic approach)
 # ---------------------------------------------------------------------------
 print("\n[SYMBOLIC] Extracting formula for u_t ...")
+kan_pde = model.model_
 kan_pde.save_act = True
 with torch.no_grad():
-    _ = kan_pde(dataset["train_input"][:2000])
+    _ = kan_pde(model._train_input[:2000])
 
 kan_pde.auto_symbolic(lib=["x", "x^2", "x^3", "0"], weight_simple=0.1)
 exprs_raw, vars_ = kan_pde.symbolic_formula()
@@ -304,8 +293,8 @@ print(f"\n  [TRUE] u_t = -u*u_x - u_xx - u_xxxx")
 # 10. Evaluation — pointwise MSE
 # ---------------------------------------------------------------------------
 with torch.no_grad():
-    yhat = kan_pde(Xn).cpu().numpy().reshape(-1)
-    ytrue = y.cpu().numpy().reshape(-1)
+    yhat = kan_pde(torch.tensor(Xn_np, dtype=torch.float32)).cpu().numpy().reshape(-1)
+    ytrue = y_np.reshape(-1)
 mse = np.mean((yhat - ytrue)**2)
 print(f"\n[EVAL]  Overall MSE: {mse:.6e}")
 
@@ -365,8 +354,8 @@ fig.savefig("results/KS/spacetime.pdf", dpi=300, bbox_inches="tight")
 plt.close(fig)
 
 # 12b. Edge activations
-n_sub_plot = min(5000, len(train_idx))
-sub_theta = Xn[train_idx[:n_sub_plot]]
+n_sub_plot = min(5000, len(Xn_np))
+sub_theta = torch.tensor(Xn_np[:n_sub_plot], dtype=torch.float32)
 fig, axes = plot_all_edges(
     kan_pde,
     X=sub_theta,
@@ -377,9 +366,9 @@ fig, axes = plot_all_edges(
 plt.close(fig)
 
 # 12c. Loss curves
-if results:
+if model.train_results_:
     fig, ax = plot_loss_curves(
-        results,
+        model.train_results_,
         save="results/KS/loss_curves",
     )
     plt.close(fig)

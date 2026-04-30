@@ -27,9 +27,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
-from kan import KAN
 
-from kandy.training import fit_kan
+from kandy import KANDy, CustomLift
 from kandy.plotting import (
     plot_all_edges,
     plot_loss_curves,
@@ -159,22 +158,11 @@ X_mean = Theta.mean(dim=0, keepdim=True)
 X_std = Theta.std(dim=0, keepdim=True) + 1e-8
 Theta_n = (Theta - X_mean) / X_std
 
-# Random train/test split
-N_total = Theta_n.shape[0]
-perm = torch.randperm(N_total, device=device)
-N_test = max(1, int(0.2 * N_total))
-test_idx = perm[:N_test]
-train_idx = perm[N_test:]
-
-dataset = {
-    "train_input": Theta_n[train_idx],
-    "train_label": y[train_idx],
-    "test_input":  Theta_n[test_idx],
-    "test_label":  y[test_idx],
-}
+Theta_np = Theta_n.numpy()
+y_np = y.numpy()
 
 print(f"[DATA]  Features: {N_FEATURES} {FEATURE_NAMES}")
-print(f"[DATA]  Train: {len(train_idx)}, Test: {N_test}")
+print(f"[DATA]  Samples: {len(Theta_np)}")
 
 # ---------------------------------------------------------------------------
 # 5. Rollout windows for integration loss
@@ -196,14 +184,14 @@ def sample_windows(U, T, H, n_windows, seed=0):
 
 
 train_u_trj, train_t_trj = sample_windows(U_series, t_series, ROLLOUT_HORIZON, 12, seed=1)
-dataset["train_traj"] = train_u_trj        # (12, H+1, Nx)
-dataset["train_t"] = train_t_trj[0]        # (H+1,) shared time grid
 
 # ---------------------------------------------------------------------------
-# 6. KAN model and dynamics function
+# 6. KANDy model and PDE dynamics function
 # ---------------------------------------------------------------------------
 rbf = lambda x: torch.exp(-(3 * x**2))
-kan_pde = KAN(width=[N_FEATURES, 1], grid=5, k=3, base_fun=rbf, seed=SEED)
+burgers_lift = CustomLift(fn=lambda X: X, output_dim=N_FEATURES, name="burgers_fourier")
+
+model = KANDy(lift=burgers_lift, grid=5, k=3, steps=50, seed=SEED, base_fun=rbf)
 
 
 def dynamics_fn(u):
@@ -212,27 +200,26 @@ def dynamics_fn(u):
         u = u.unsqueeze(0)
     Theta_local = build_library(u)
     Theta_local_n = (Theta_local - X_mean) / X_std
-    ut = kan_pde(Theta_local_n)
+    ut = model.model_(Theta_local_n)
     if ut.dim() == 2 and ut.shape[1] == 1:
         ut = ut[:, 0]
     return ut.reshape(u.shape[0], u.shape[1])
 
 
 # ---------------------------------------------------------------------------
-# 7. Train with rollout loss
+# 7. Train via KANDy.fit() with custom dynamics and trajectory windows
 # ---------------------------------------------------------------------------
 print("\n[TRAIN] Training KAN with rollout loss ...")
-results = fit_kan(
-    kan_pde,
-    dataset,
-    steps=50,
+model.fit(
+    X=Theta_np,
+    X_dot=y_np,
+    val_frac=0.0,
+    test_frac=0.2,
     lr=10,
-    lamb=0.0,
     rollout_weight=10.1,
     rollout_horizon=ROLLOUT_HORIZON,
-    traj_batch=1,
     dynamics_fn=dynamics_fn,
-    integrator="euler",
+    dataset_extras={"train_traj": train_u_trj, "train_t": train_t_trj[0]},
     stop_grid_update_step=250,
     patience=0,
 )
@@ -241,9 +228,10 @@ results = fit_kan(
 # 8. Symbolic extraction
 # ---------------------------------------------------------------------------
 print("\n[SYMBOLIC] Extracting formula for u_t ...")
+kan_pde = model.model_
 kan_pde.save_act = True
 with torch.no_grad():
-    _ = kan_pde(dataset["train_input"][:5000])
+    _ = kan_pde(model._train_input[:5000])
 
 # Per-edge symbolic fitting with r2 threshold (matches robust_auto_symbolic)
 import sympy as sp
@@ -357,8 +345,8 @@ fig.savefig(f"{RESULTS}/final_snapshot.pdf", dpi=300, bbox_inches="tight")
 plt.close(fig)
 
 # 10c. Edge activations
-n_sub = min(5000, len(train_idx))
-sub_theta = Theta_n[train_idx[:n_sub]]
+n_sub = min(5000, len(Theta_np))
+sub_theta = torch.tensor(Theta_np[:n_sub], dtype=torch.float32)
 
 fig, axes = plot_all_edges(
     kan_pde,
@@ -371,9 +359,9 @@ fig, axes = plot_all_edges(
 plt.close(fig)
 
 # 10d. Loss curves
-if results:
+if model.train_results_:
     fig, ax = plot_loss_curves(
-        results,
+        model.train_results_,
         save=f"{RESULTS}/loss_curves",
     )
     plt.close(fig)

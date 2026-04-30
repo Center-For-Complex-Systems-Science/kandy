@@ -21,9 +21,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from kan import KAN
-
-from kandy.training import fit_kan
+from kandy import KANDy, CustomLift
 from kandy.plotting import (
     plot_all_edges,
     use_pub_style,
@@ -121,13 +119,22 @@ dataset_phi = {
 # ---------------------------------------------------------------------------
 # 3. Train both models
 # ---------------------------------------------------------------------------
+raw_lift = CustomLift(fn=lambda X: X.numpy() if hasattr(X, 'numpy') else X,
+                      output_dim=4, name="identity_s3")
+eng_lift = CustomLift(fn=lambda X: X.numpy() if hasattr(X, 'numpy') else X,
+                      output_dim=5, name="hopf_engineered")
+
 print("\n--- Model A: raw identity lift (KAN=[4,3]) ---")
-model_raw = KAN(width=[4, 3], grid=64, k=3, base_fun=rbf, seed=SEED)
-fit_kan(model_raw, dataset_raw, steps=400, patience=0)
+kandy_raw = KANDy(lift=raw_lift, grid=64, k=3, steps=400, seed=SEED, base_fun=rbf)
+kandy_raw.fit(X=X_train.numpy(), X_dot=Y_train_n.numpy(),
+              val_frac=0.0, test_frac=0.2, patience=0)
+model_raw = kandy_raw.model_
 
 print("\n--- Model B: engineered Hopf lift (KAN=[5,3]) ---")
-model_phi = KAN(width=[5, 3], grid=64, k=3, base_fun=rbf, seed=SEED)
-fit_kan(model_phi, dataset_phi, steps=400, patience=0)
+kandy_eng = KANDy(lift=eng_lift, grid=64, k=3, steps=400, seed=SEED, base_fun=rbf)
+kandy_eng.fit(X=Phi_train_n.numpy(), X_dot=Y_train.numpy(),
+              val_frac=0.0, test_frac=0.2, patience=0)
+model_phi = kandy_eng.model_
 
 # ---------------------------------------------------------------------------
 # 4. Evaluation

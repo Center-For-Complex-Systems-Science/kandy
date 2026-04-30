@@ -26,9 +26,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
-from kan import KAN
 
-from kandy.training import fit_kan
+from kandy import KANDy, CustomLift
 from kandy.plotting import (
     plot_all_edges,
     plot_loss_curves,
@@ -155,33 +154,21 @@ y = Ut_k.reshape(-1, 1)                   # ((K-1)*Nx, 1)
 # No normalization — preserves physical coefficients for symbolic extraction
 X_mean = torch.zeros(1, N_FEATURES)
 X_std = torch.ones(1, N_FEATURES)
-Theta_n = Theta
 
 # Subsample for LBFGS (struggles with >80K samples)
 MAX_SAMPLES = 80_000
-N_total = Theta_n.shape[0]
-g_perm = torch.Generator(device=device)
-g_perm.manual_seed(SEED)
-perm = torch.randperm(N_total, device=device, generator=g_perm)
+N_total = Theta.shape[0]
 if N_total > MAX_SAMPLES:
-    perm = perm[:MAX_SAMPLES]
-    N_total = MAX_SAMPLES
+    g_perm = torch.Generator(device=device)
+    g_perm.manual_seed(SEED)
+    perm = torch.randperm(N_total, device=device, generator=g_perm)[:MAX_SAMPLES]
+    Theta = Theta[perm]
+    y = y[perm]
+    print(f"[DATA]  Subsampled to {MAX_SAMPLES} from {N_total}")
 
-# Random train/test split
-test_frac = 0.2
-N_test = max(1, int(test_frac * N_total))
-test_idx = perm[:N_test]
-train_idx = perm[N_test:]
-
-dataset = {
-    "train_input": Theta_n[train_idx],
-    "train_label": y[train_idx],
-    "test_input":  Theta_n[test_idx],
-    "test_label":  y[test_idx],
-}
-
-print(f"[DATA]  Features: {N_FEATURES}, samples: {N_total} (subsampled from {Theta_n.shape[0]})")
-print(f"[DATA]  Train: {len(train_idx)}, Test: {N_test}")
+Theta_np = Theta.numpy()
+y_np = y.numpy()
+print(f"[DATA]  Features: {N_FEATURES}, samples: {len(Theta_np)}")
 
 # ---------------------------------------------------------------------------
 # 4. Rollout windows for integration loss
@@ -203,14 +190,14 @@ def sample_windows(U, T, H, n_windows, seed=0):
 
 
 train_u_trj, train_t_trj = sample_windows(U_series, t_series, ROLLOUT_HORIZON, 1, seed=1)
-dataset["train_traj"] = train_u_trj  # (1, H+1, Nx)
-dataset["train_t"] = train_t_trj     # (1, H+1)
 
 # ---------------------------------------------------------------------------
-# 5. KAN model (width=[3, 1]) and dynamics function
+# 5. KANDy model and PDE dynamics function
 # ---------------------------------------------------------------------------
 rbf = lambda x: torch.exp(-(x**2))
-kan_pde = KAN(width=[N_FEATURES, 1], grid=7, k=3, base_fun=rbf, seed=SEED)
+burgers_lift = CustomLift(fn=lambda X: X, output_dim=N_FEATURES, name="burgers_precomputed")
+
+model = KANDy(lift=burgers_lift, grid=7, k=3, steps=50, seed=SEED, base_fun=rbf)
 
 
 def dynamics_training_fn(u_state):
@@ -220,23 +207,24 @@ def dynamics_training_fn(u_state):
     ux = tvd_ux(u_state, DX)
     Theta_local = build_burgers_library(u_state, ux)
     Theta_local_n = (Theta_local - X_mean) / X_std
-    ut = kan_pde(Theta_local_n)
+    ut = model.model_(Theta_local_n)
     ut = ut[:, 0].reshape(u_state.shape[0], u_state.shape[1])
     return ut
 
 
 # ---------------------------------------------------------------------------
-# 6. Train with fit_kan (rollout loss enabled)
+# 6. Train via KANDy.fit() with custom dynamics_fn and trajectory windows
 # ---------------------------------------------------------------------------
 print("\n[TRAIN] Training KAN with rollout loss ...")
-results = fit_kan(
-    kan_pde,
-    dataset,
-    steps=50,
+model.fit(
+    X=Theta_np,
+    X_dot=y_np,
+    val_frac=0.0,
+    test_frac=0.2,
     rollout_weight=10.9,
     rollout_horizon=ROLLOUT_HORIZON,
     dynamics_fn=dynamics_training_fn,
-    integrator="rk4",
+    dataset_extras={"train_traj": train_u_trj, "train_t": train_t_trj},
     patience=0,
 )
 
@@ -244,9 +232,10 @@ results = fit_kan(
 # 7. Symbolic extraction
 # ---------------------------------------------------------------------------
 print("\n[SYMBOLIC] Extracting formula for u_t ...")
+kan_pde = model.model_
 kan_pde.save_act = True
 with torch.no_grad():
-    _ = kan_pde(dataset["train_input"])
+    _ = kan_pde(model._train_input)
 
 # Per-edge symbolic fitting with r2 threshold (matches robust_auto_symbolic)
 import sympy as sp
@@ -272,7 +261,6 @@ sub_map = {
 for expr_str in exprs:
     sym = sp.sympify(expr_str).xreplace(sub_map)
     sym = sp.expand(sym)
-    # Round small coefficients
     sym = sym.xreplace({n: round(float(n), 3) for n in sym.atoms(sp.Number)})
     print(f"  u_t = {sym}")
 
@@ -286,7 +274,7 @@ def dynamics_fn_eval(u):
     ux = tvd_ux(u, DX)
     Theta_local = build_burgers_library(u, ux)
     Theta_local_n = (Theta_local - X_mean) / X_std
-    ut = kan_pde(Theta_local_n)
+    ut = model.model_(Theta_local_n)
     if ut.dim() == 2 and ut.shape[1] == 1:
         ut = ut[:, 0]
     return ut.reshape(u.shape[0], u.shape[1])
@@ -351,13 +339,12 @@ fig.savefig(f"{RESULTS}/final_snapshot.pdf", dpi=300, bbox_inches="tight")
 plt.close(fig)
 
 # 9c. Edge activations
-n_sub = min(5000, len(train_idx))
-sub_idx = train_idx[:n_sub]
-train_t = Theta_n[sub_idx]
+n_sub = min(5000, len(Theta_np))
+sub_theta = torch.tensor(Theta_np[:n_sub], dtype=torch.float32)
 
 fig, axes = plot_all_edges(
     kan_pde,
-    X=train_t,
+    X=sub_theta,
     fits=["linear"],
     in_var_names=FEATURE_NAMES,
     out_var_names=["u_t"],
@@ -366,9 +353,9 @@ fig, axes = plot_all_edges(
 plt.close(fig)
 
 # 9d. Loss curves
-if results:
+if model.train_results_:
     fig, ax = plot_loss_curves(
-        results,
+        model.train_results_,
         save=f"{RESULTS}/loss_curves",
     )
     plt.close(fig)
