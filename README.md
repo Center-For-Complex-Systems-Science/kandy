@@ -540,3 +540,21 @@ model.fit(dataset)
 # Maintainers
 author: [Kevin Slote](www.kevin-slote.com)
 email: kslote@clarkson.edu or kslote1@gmail.com
+
+## Citation
+
+If you use KANDy in your work, please cite:
+
+```bibtex
+@misc{slote2026kandy,
+  title         = {KANDy: Kolmogorov-Arnold Networks and Dynamical System Discovery},
+  author        = {Slote, Kevin and Fish, Jeremie and Bollt, Erik},
+  year          = {2026},
+  eprint        = {2602.20413},
+  archivePrefix = {arXiv},
+  primaryClass  = {math.DS},
+  doi           = {10.48550/arXiv.2602.20413}
+}
+```
+
+
