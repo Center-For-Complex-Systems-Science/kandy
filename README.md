@@ -53,7 +53,7 @@ claude code .
 ## Installation
 
 ```bash
-pip install -e .
+pip install kandy
 ```
 
 **Requirements:** Python 3.11–3.13 · PyTorch ≥ 2.0 · PyKAN ≥ 0.2.0 · SciPy ≥ 1.10 · SymPy ≥ 1.12 · NumPy ≥ 1.24 · Matplotlib ≥ 3.7
